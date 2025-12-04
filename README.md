@@ -82,10 +82,8 @@ We included datasets with other neurological conditions (e.g., Alzheimer's, Stro
 
 We thank the authors of the following repositories for their open-source contributions, which were instrumental in this research:
 
-* **dMRI Preprocessing & Quantitative Maps:**
-    * [NYU-DiffusionMRI/DESIGNER-v2](https://github.com/NYU-DiffusionMRI/DESIGNER-v2): Diffusion parameter EStImation with Gibbs and NoisE Removal pipeline Version 2.
-* **Pre-trained Models:**
-    * [Luffy03/Large-Scale-Medical](https://github.com/Luffy03/Large-Scale-Medical): [TPAMI 2025] Large-Scale 3D Medical Image Pre-training with Geometric Context Priors.
+* **dMRI Preprocessing & Quantitative Maps:** [NYU-DiffusionMRI/DESIGNER-v2](https://github.com/NYU-DiffusionMRI/DESIGNER-v2)
+* **Pre-trained Models:** [Luffy03/Large-Scale-Medical](https://github.com/Luffy03/Large-Scale-Medical)
 
 ---
 
