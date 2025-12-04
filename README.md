@@ -45,7 +45,7 @@ The DeepMS framework utilizes a novel deep learning architecture designed for ro
 
 ---
 
-## 📊 External Datasets (updating)
+## 📊 External Datasets (Incomplete, finished by Dec 08)
 
 To ensure robustness, we use additional ADNI data for training and evaluated DeepMS on 15 other external cohorts.
 
@@ -60,7 +60,7 @@ To ensure robustness, we use additional ADNI data for training and evaluated Dee
 | **MS-ISBI** | 19 | MS | [JHU / IACL](https://smart-stats-tools.org/lesion-challenge) |
 | **PediMS** | 9 | Pediatric MS | [Babeș-Bolyai Univ.](https://github.com/DanieleStefano/PediMS-dataset) |
 
-### 2. Non-MS Datasets (Generalizability & Specificity)
+### 2. Non-MS Datasets
 
 We included datasets with other neurological conditions (e.g., Alzheimer's, Stroke, Tumor, Epilepsy) to test the model's specificity and performance on unseen pathologies.
 
