@@ -45,7 +45,7 @@ The DeepMS framework utilizes a novel deep learning architecture designed for ro
 
 ---
 
-## 📊 External Datasets
+## 📊 External Datasets (updating)
 
 To ensure robustness, we use additional ADNI data for training and evaluated DeepMS on 15 other external cohorts.
 
@@ -53,7 +53,7 @@ To ensure robustness, we use additional ADNI data for training and evaluated Dee
 
 | Dataset | Subjects ($N$) | Diagnosis | Source / Access |
 | :--- | :---: | :--- | :--- |
-| **QSM** | 150 | MS (100) / HC (50) | [Univ. of Bologna](https://pubmed.ncbi.nlm.nih.gov/29557620/) |
+| **QSM** | 150 | MS (100) / HC (50) | [Univ. of Bologna](https://zenodo.org/records/10931121) |
 | **MSSEG-2016** | 53 | MS | [Inria / MSSEG](https://portal.fli-iam.irisa.fr/msseg-challenge/overview) |
 | **Open MS Data** | 50 | MS | [Univ. of Ljubljana](https://github.com/muschellij2/open_ms_data) |
 | **MSSEG-2** | 40 | MS | [Inria / MSSEG-2](https://portal.fli-iam.irisa.fr/msseg-2/data/) |
