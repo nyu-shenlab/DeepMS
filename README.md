@@ -1,6 +1,6 @@
 <div align="center">
 
-# Diagnosis of Multiple Sclerosis Using Multimodal Deep Learning Integrating Lesion and Normal-Appearing White Matter: A Retrospective Study with International Multicentre External Validation
+# Diagnosis of Multiple Sclerosis Using Multimodal Deep Learning Integrating Lesion and Normal-Appearing White Matter
 
 [![RSNA Award](https://img.shields.io/badge/RSNA_2025-Winner-gold?style=for-the-badge&logo=medal)](https://www.rsna.org/research/research-awards/kuo-york-chynn-neuro-research-award)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE)
@@ -29,7 +29,7 @@ Our study includes large-scale model development, multireader comparison with es
 - **Lesion + NAWM integration**: captures both focal lesion burden and latent NAWM-related diagnostic signals
 - **Strong generalizability**: validated on an independent Krakow cohort and 15 public external datasets
 - **Lesion-masking robustness**: retains diagnostic performance after removal of visible white matter lesions
-- **Clinical relevance**: compared against established biomarkers including DIS, DIT, CVS, and PRL in a multireader study
+- **Clinical relevance**: compared against established biomarkers including DIS, DIT, CVS, and PRL
 
 ---
 
