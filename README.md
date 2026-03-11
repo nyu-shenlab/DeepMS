@@ -7,7 +7,7 @@
 
 <h3>🏆 Winner of the Kuo York Chynn Neuroradiology Research Award at RSNA 2025</h3>
 
-[**Manuscript**](https://www.medrxiv.org/content/10.64898/2026.03.04.26347460v1) • [**medRxiv**](https://www.medrxiv.org/content/10.64898/2026.03.04.26347460v1) • [**Citation**](#citation)
+[**Manuscript**](https://www.medrxiv.org/content/10.64898/2026.03.04.26347460v1) • [**Citation**](#citation)
 
 </div>
 
@@ -39,9 +39,10 @@ We are actively preparing the codebase and release materials for public dissemin
 
 - [x] Manuscript available on medRxiv
 - [x] External public datasets documented
-- [x] Preprocessing pipeline prepared for release
-- [x] Model architecture and training framework prepared for release
-- [x] Validation and inference workflow prepared for release
+- [x] Preprocessing pipeline
+- [x] Model architecture and training framework
+- [x] Validation and inference workflow
+- [ ] Environment setup and bash scripts (coming soon)
 
 ---
 
@@ -72,8 +73,8 @@ DeepMS demonstrated robust performance across internal and external evaluations:
 - **Internal test cohort**: AUC 0.968
 - **Independent Krakow cohort**: AUC 0.940
 - **Public multi-site external cohort**: AUC 0.974
-- **Lesion-masking analysis**: substantial diagnostic signal retained after all lesion & perilesional info removal (AUC 0.974)
-- **Multireader study**: outperformed established lesion-based biomarkers under matched sensitivity or specificity settings
+- **Lesion-masking analysis**: substantial diagnostic signal retained after all WMLs removal (AUC 0.974)
+- **Multireader study**: outperformed established lesion-based biomarkers
 
 
 ![Reader Study](assets/reader_study.png)
