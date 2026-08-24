@@ -1,0 +1,24 @@
+# uv / Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Training and inference artifacts
+outputs/
+visualizations/
+runs/
+wandb/
+*.pth
+*.pt
+
+# Slurm logs
+slurm-*.out
+slurm-*.err
+
+# Local configuration and editor files
+.env
+.DS_Store
+.idea/
+.vscode/

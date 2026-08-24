@@ -3,8 +3,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-
-from timm.models.layers import to_2tuple, to_3tuple
+from timm.layers import to_2tuple, to_3tuple
 
 
 def build_sincos_position_embedding(
@@ -79,7 +78,7 @@ def build_sincos_position_embedding(
 def nth_root(N,k):
     """Return greatest integer x such that x**k <= N"""
     """https://stackoverflow.com/questions/15978781/how-to-find-integer-nth-roots"""
-    x = int(N**(1/k))      
+    x = int(N**(1/k))
     while (x+1)**k <= N:
         x += 1
     while x**k > N:
@@ -92,8 +91,8 @@ def nth_root(N,k):
 # DeiT: https://github.com/facebookresearch/deit
 # --------------------------------------------------------
 def interpolate_pos_embed(
-    model: torch.nn.Module, 
-    checkpoint_model: collections.OrderedDict, 
+    model: torch.nn.Module,
+    checkpoint_model: collections.OrderedDict,
     spatial_dims: int = 3,
 ) -> None:
     """
@@ -107,7 +106,7 @@ def interpolate_pos_embed(
     :type spatial_dims: int
     :returns: None
     """
-    
+
     if 'patch_embedding.position_embeddings' in checkpoint_model:
         pos_embed_checkpoint = checkpoint_model['patch_embedding.position_embeddings']
         embedding_size = pos_embed_checkpoint.shape[-1]
@@ -118,7 +117,7 @@ def interpolate_pos_embed(
             orig_size = int(nth_root(pos_embed_checkpoint.shape[-2] - num_extra_tokens, spatial_dims))
         else:
             raise NotImplementedError(f"Spatial Dimension Size {spatial_dims} Not Implemented!")
-            
+
         # height (== width) for the new position embedding
         new_size = int(nth_root(num_patches, spatial_dims))
 
@@ -140,6 +139,6 @@ def interpolate_pos_embed(
                 pos_tokens = pos_tokens.permute(0, 2, 3, 4, 1).flatten(1, 3)
             else:
                 raise NotImplementedError(f"Spatial Dimension Size {spatial_dims} Not Implemented!")
-            
+
             new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
             checkpoint_model['patch_embedding.position_embeddings'] = new_pos_embed

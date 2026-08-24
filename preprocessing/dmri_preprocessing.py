@@ -3,14 +3,13 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
 from monai.transforms import Compose, EnsureChannelFirstd, LoadImaged, Orientationd, Transform
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -293,7 +292,7 @@ def preprocess_single_patient(
 ) -> Tuple[Dict[str, str], List[pd.Series]]:
     """
     Process one patient.
-    
+
     Returns
     -------
     updated_existing : dict
@@ -485,24 +484,9 @@ def preprocess_images(args: argparse.Namespace) -> pd.DataFrame:
 # =========================================================
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Preprocess diffusion MRI images for GitHub-ready pipeline.")
-    parser.add_argument(
-        "--dataset_path",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/ms-diagnosis/meta_data/updated_label_dataset/train_dataset_all.csv",
-        help="Path to the dataset CSV file.",
-    )
-    parser.add_argument(
-        "--output_base_path",
-        type=str,
-        default="/gpfs/scratch/jm10850/ms_data/MESO_V2.0/PROCESSED_OUTPUT",
-        help="Base path for saving processed images.",
-    )
-    parser.add_argument(
-        "--output_csv_path",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/ms-diagnosis/meta_data/updated_label_dataset/train_dataset_all_latest.csv",
-        help="Path to save the updated dataset CSV.",
-    )
+    parser.add_argument("--dataset_path", type=str, required=True, help="Input metadata CSV.")
+    parser.add_argument("--output_base_path", type=str, required=True, help="Directory for processed images.")
+    parser.add_argument("--output_csv_path", type=str, required=True, help="Path for the updated metadata CSV.")
     parser.add_argument(
         "--verbose",
         action="store_true",

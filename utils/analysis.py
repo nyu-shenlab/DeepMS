@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    auc,
     average_precision_score,
     precision_recall_curve,
     roc_auc_score,
-    auc,
 )
-
 
 DEFAULT_ID_COL = "m_id"
 DEFAULT_LABEL_COL = "ms"
@@ -23,7 +22,12 @@ DEFAULT_MODALITY_COL = "modality"
 def sigmoid(x: np.ndarray) -> np.ndarray:
     """Numerically stable sigmoid."""
     x = np.asarray(x, dtype=float)
-    return 1.0 / (1.0 + np.exp(-x))
+    output = np.empty_like(x, dtype=float)
+    positive = x >= 0
+    output[positive] = 1.0 / (1.0 + np.exp(-x[positive]))
+    exp_x = np.exp(x[~positive])
+    output[~positive] = exp_x / (1.0 + exp_x)
+    return output
 
 
 def _validate_columns(df: pd.DataFrame, required_cols: Sequence[str]) -> None:
@@ -216,6 +220,111 @@ def avg_logits_ensemble(
         threshold=threshold,
         verbose=verbose,
     )
+
+
+def grouped_avg_prob_ensemble(
+    all_results_df: pd.DataFrame,
+    print_result: bool = True,
+    return_metrics: bool = False,
+):
+    """Compute a modality-balanced structural/diffusion probability ensemble.
+
+    Repeated scans are first averaged within ``(patient, modality)``. Modalities
+    are then averaged within dMRI families, followed by an equal-weight average
+    between the available sMRI and dMRI branches.
+    """
+    required_cols = [DEFAULT_ID_COL, DEFAULT_LABEL_COL, DEFAULT_PROB_COL, DEFAULT_MODALITY_COL]
+    _validate_columns(all_results_df, required_cols)
+
+    def modality_family(modality: str) -> str:
+        name = str(modality).lower()
+        if "dti" in name:
+            return "dti"
+        if "smi" in name:
+            return "smi"
+        if "wdki" in name or "_dki" in name:
+            return "wdki"
+        return "sMRI"
+
+    df = all_results_df.loc[:, required_cols].copy()
+    df = df.dropna(subset=[DEFAULT_PROB_COL])
+
+    inconsistent = df.groupby(DEFAULT_ID_COL)[DEFAULT_LABEL_COL].nunique(dropna=False) > 1
+    if inconsistent.any():
+        raise ValueError(
+            f"Found {int(inconsistent.sum())} patients with conflicting labels."
+        )
+
+    modality_level = (
+        df.groupby([DEFAULT_ID_COL, DEFAULT_MODALITY_COL], as_index=False)
+        .agg(
+            **{
+                DEFAULT_PROB_COL: (DEFAULT_PROB_COL, "mean"),
+                DEFAULT_LABEL_COL: (DEFAULT_LABEL_COL, "first"),
+            }
+        )
+    )
+    modality_level["modality_type"] = modality_level[DEFAULT_MODALITY_COL].map(modality_family)
+
+    grouped = (
+        modality_level.groupby([DEFAULT_ID_COL, "modality_type"], as_index=False)
+        .agg(
+            **{
+                DEFAULT_PROB_COL: (DEFAULT_PROB_COL, "mean"),
+                DEFAULT_LABEL_COL: (DEFAULT_LABEL_COL, "first"),
+            }
+        )
+    )
+
+    probability_columns = {
+        "sMRI": "sMRI_prob",
+        "dti": "dti_prob",
+        "smi": "smi_prob",
+        "wdki": "wdki_prob",
+    }
+    wide = grouped.pivot(
+        index=DEFAULT_ID_COL,
+        columns="modality_type",
+        values=DEFAULT_PROB_COL,
+    ).rename(columns=probability_columns)
+
+    labels = modality_level.groupby(DEFAULT_ID_COL)[DEFAULT_LABEL_COL].first()
+    ensemble_df = labels.to_frame().join(wide)
+    for column in probability_columns.values():
+        if column not in ensemble_df:
+            ensemble_df[column] = np.nan
+
+    ensemble_df["dmri_avg_prob"] = ensemble_df[
+        ["dti_prob", "smi_prob", "wdki_prob"]
+    ].mean(axis=1, skipna=True)
+    ensemble_df[DEFAULT_PROB_COL] = ensemble_df[
+        ["sMRI_prob", "dmri_avg_prob"]
+    ].mean(axis=1, skipna=True)
+    ensemble_df["ensemble_pred"] = (
+        ensemble_df[DEFAULT_PROB_COL] >= 0.5
+    ).astype(int)
+    ensemble_df = ensemble_df.reset_index()
+
+    valid_df = ensemble_df.dropna(subset=[DEFAULT_PROB_COL])
+    metrics = _safe_binary_metrics(
+        valid_df[DEFAULT_LABEL_COL].to_numpy(),
+        valid_df[DEFAULT_PROB_COL].to_numpy(),
+    )
+    if print_result:
+        _print_metrics(metrics, prefix="[Two-level Ensemble]")
+
+    if return_metrics:
+        values = [
+            metrics["accuracy"],
+            metrics["roc_auc"],
+            metrics["pr_auc"],
+            metrics["average_precision"],
+        ]
+        accuracy, roc_auc, pr_auc, average_precision = [
+            0.0 if np.isnan(value) else float(value) for value in values
+        ]
+        return ensemble_df, accuracy, roc_auc, pr_auc, average_precision
+    return ensemble_df
 
 
 def _map_smri_modality(modality: str) -> Optional[str]:

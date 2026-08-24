@@ -1,11 +1,9 @@
 import os
 import sys
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from monai.networks.nets import SwinUNETR
 
 sys.path.append(os.getcwd())
@@ -191,7 +189,7 @@ class MultiABMILPredictor(nn.Module):
         a_u = self.attention_U(x)
         a = a_v * a_u
         # use sigmoid rather than softmax to avoid competition between voxels
-        attention_map = torch.sigmoid(self.attention_weights(a))  # (B, num_heads, D, H, W) 
+        attention_map = torch.sigmoid(self.attention_weights(a))  # (B, num_heads, D, H, W)
 
         x_reshaped = x.view(b, self.num_heads, self.head_dim, d, h, w)
         attention_map_expanded = attention_map.unsqueeze(2)  # (B, num_heads, 1, D, H, W)
@@ -287,8 +285,11 @@ class VisualEncoder(nn.Module):
         print(f"[Info] Loading finetuned backbone from: {finetuned_backbone}")
         state_dict = torch.load(finetuned_backbone, map_location="cpu", weights_only=False)
 
-        if isinstance(state_dict, dict) and "state_dict" in state_dict:
-            state_dict = state_dict["state_dict"]
+        if isinstance(state_dict, dict):
+            if "model_state_dict" in state_dict:
+                state_dict = state_dict["model_state_dict"]
+            elif "state_dict" in state_dict:
+                state_dict = state_dict["state_dict"]
 
         corrected_state_dict = {}
         for k, v in state_dict.items():

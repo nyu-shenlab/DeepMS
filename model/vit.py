@@ -15,16 +15,9 @@ from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
-
-import sys
-import os
-
-sys.path.append(os.getcwd())
+from monai.networks.blocks.transformerblock import TransformerBlock
 
 from utils.patch_embedding import PatchEmbeddingBlock
-from model.flashattentionblock import FlashAttentionBlock
-
-from monai.networks.blocks.transformerblock import TransformerBlock
 
 __all__ = ["ViT"]
 
@@ -59,7 +52,7 @@ class ViT(nn.Module):
     ) -> None:
         """
         Args:
-            in_channels (int): dimension of input channels.
+            in_chans (int): dimension of input channels.
             img_size (Union[Sequence[int], int]): dimension of input image.
             patch_size (Union[Sequence[int], int]): dimension of patch size.
             hidden_size (int, optional): dimension of hidden layer. Defaults to 768.
@@ -76,18 +69,19 @@ class ViT(nn.Module):
                 when `classification` is True. Default to "Tanh" for `nn.Tanh()`.
                 Set to other values to remove this function.
             qkv_bias (bool, optional): apply bias to the qkv linear layer in self attention block. Defaults to False.
-            save_attn (bool, optional): to make accessible the attention in self attention block. Defaults to False.
+            use_flash_attn (bool, optional): reserved for checkpoint compatibility. The public
+                release currently supports the standard MONAI transformer block.
 
         Examples::
 
             # for single channel input with image size of (96,96,96), conv position embedding and segmentation backbone
-            >>> net = ViT(in_channels=1, img_size=(96,96,96), patch_embed='conv', pos_embed='sincos')
+            >>> net = ViT(in_chans=1, img_size=(96,96,96), patch_size=(16,16,16), patch_embed='conv', pos_embed='sincos')
 
             # for 3-channel with image size of (128,128,128), 24 layers and classification backbone
-            >>> net = ViT(in_channels=3, img_size=(128,128,128), patch_embed='conv', pos_embed='sincos', classification=True)
+            >>> net = ViT(in_chans=3, img_size=(128,128,128), patch_size=(16,16,16), patch_embed='conv', pos_embed='sincos', classification=True)
 
             # for 3-channel with image size of (224,224), 12 layers and classification backbone
-            >>> net = ViT(in_channels=3, img_size=(224,224), patch_embed='conv', pos_embed='sincos', classification=True,
+            >>> net = ViT(in_chans=3, img_size=(224,224), patch_size=(16,16), patch_embed='conv', pos_embed='sincos', classification=True,
             >>>           spatial_dims=2)
 
         """
@@ -100,10 +94,14 @@ class ViT(nn.Module):
         if hidden_size % num_heads != 0:
             raise ValueError("hidden_size should be divisible by num_heads.")
 
+        if use_flash_attn:
+            raise NotImplementedError(
+                "use_flash_attn=True is not supported by the public DeepMS environment."
+            )
+
         self.classification = classification
-        self.use_flash_attn = use_flash_attn
-        self.pooling = pooling # use_last_layer_norm or not
-        
+        self.pooling = pooling
+
         self.patch_embedding = PatchEmbeddingBlock(
             img_size=img_size,
             patch_size=patch_size,
@@ -115,29 +113,20 @@ class ViT(nn.Module):
             dropout_rate=dropout_rate,
             spatial_dims=spatial_dims,
         )
-        
-        if use_flash_attn:
-            # transformer encoder
-            self.blocks = nn.ModuleList(
-                [
-                    FlashAttentionBlock(hidden_size, mlp_dim, num_heads, dropout_rate, \
-                        qkv_bias=qkv_bias, save_attn=False, with_cross_attention=False)
-                    for i in range(num_layers)
-                ]
-            )
-        else:
-            # transformer encoder
-            self.blocks = nn.ModuleList(
-                [
-                    TransformerBlock(hidden_size, mlp_dim, num_heads, dropout_rate, \
-                        qkv_bias=qkv_bias, save_attn=False, with_cross_attention=False)  # with_cross_attention=False
-                    for i in range(num_layers)
-                ]
-            )
-            
+
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    hidden_size, mlp_dim, num_heads, dropout_rate,
+                    qkv_bias=qkv_bias, save_attn=False, with_cross_attention=False,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
         self.norm = nn.LayerNorm(hidden_size)
-        
+
         if self.classification:
             if post_activation == "Tanh":
                 self.classification_head = nn.Sequential(nn.Linear(hidden_size, num_classes), nn.Tanh())
@@ -149,23 +138,9 @@ class ViT(nn.Module):
         if hasattr(self, "cls_token"):
             cls_token = self.cls_token.expand(x.shape[0], -1, -1)
             x = torch.cat((cls_token, x), dim=1)
-        hidden_states_out = []
-        
-        # apply Transformer blocks
-        residual = None
         for blk in self.blocks:
-            if self.use_flash_attn:
-                x = x.to(dtype=torch.bfloat16)
-                x, residual = blk(x, residual)
-                x = x.to(dtype=torch.float32)
-            else:
-                x = blk(x)
-            hidden_states_out.append(x)
-        
-        # for blk in self.blocks:
-        #     x = blk(x)
-        #     hidden_states_out.append(x)
-        if self.pooling=='layer_norm':  
+            x = blk(x)
+        if self.pooling=='layer_norm':
             x = self.norm(x)[:, 0]
             if hasattr(self, "classification_head"):
                 x = self.classification_head(x)

@@ -1,39 +1,34 @@
-import os
-import sys
-import math
-import random
-import logging
 import argparse
 import datetime
-from typing import Dict, Optional, Any
-
-import numpy as np
-import pandas as pd
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.distributed as dist
-
-from torch.utils.data import Sampler
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR
+import logging
+import os
+import random
+import sys
+from typing import Any, Dict, Optional
 
 import monai
-from monai.data import DataLoader
-from monai.utils import first
-
+import numpy as np
+import pandas as pd
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
-from sklearn.metrics import roc_auc_score
+from accelerate.utils import DistributedDataParallelKwargs, broadcast_object_list
+from monai.data import DataLoader
+from torch.utils.data import WeightedRandomSampler
+from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.getcwd())
 
-from utils.dataset import SingleModalityDataset, collate_skip_none
-from utils.transforms import FilterImages
-from utils.analysis import grouped_avg_prob_ensemble
 from model.Models import VisualEncoder
-
+from utils.dataset import SingleModalityDataset, collate_skip_none
+from utils.evaluation import summarize_validation_predictions, validate_prediction_coverage
+from utils.scheduling import (
+    UpdateWarmupCosineScheduler,
+    compute_optimizer_update_counts,
+)
+from utils.transforms import FilterImages
 
 # ---------------------------------------------------------------------
 # Optional external logging
@@ -56,148 +51,6 @@ def set_random_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-# ---------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------
-class WarmupCosineScheduler:
-    """
-    Epoch-based learning rate scheduler:
-        1) linear warmup
-        2) cosine decay
-
-    Call step() once per epoch.
-    """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        warmup_epochs: int,
-        total_epochs: int,
-        min_lr: float = 1e-6,
-        warmup_start_lr: float = 1e-7,
-        verbose: bool = False,
-    ) -> None:
-        self.optimizer = optimizer
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.min_lr = min_lr
-        self.warmup_start_lr = warmup_start_lr
-        self.verbose = verbose
-
-        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
-        self.last_epoch = 0
-        self._step_count = 0
-
-    def step(self) -> None:
-        """Advance scheduler by one epoch."""
-        self._step_count += 1
-        new_lrs = self.get_lr()
-
-        for i, (param_group, lr) in enumerate(zip(self.optimizer.param_groups, new_lrs)):
-            param_group["lr"] = lr
-            if self.verbose:
-                print(f"[Scheduler] Epoch {self._step_count}: group {i} lr -> {lr:.8f}")
-
-        self.last_epoch = self._step_count
-
-    def get_lr(self):
-        """Compute learning rates for the current scheduler step."""
-        lrs = []
-
-        for base_lr in self.base_lrs:
-            if self._step_count <= self.warmup_epochs:
-                lr = (
-                    (base_lr - self.warmup_start_lr)
-                    * self._step_count
-                    / max(self.warmup_epochs, 1)
-                    + self.warmup_start_lr
-                )
-            else:
-                denom = max(self.total_epochs - self.warmup_epochs, 1)
-                progress = (self._step_count - self.warmup_epochs) / denom
-                cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-                lr = self.min_lr + (base_lr - self.min_lr) * cosine_decay
-
-            lrs.append(lr)
-
-        return lrs
-
-    def get_last_lr(self):
-        """Return the current learning rates stored in optimizer param groups."""
-        return [group["lr"] for group in self.optimizer.param_groups]
-
-    def state_dict(self) -> Dict[str, Any]:
-        """Serialize scheduler state."""
-        return {
-            "base_lrs": self.base_lrs,
-            "last_epoch": self.last_epoch,
-            "_step_count": self._step_count,
-        }
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        """Load scheduler state."""
-        self.base_lrs = state_dict["base_lrs"]
-        self.last_epoch = state_dict["last_epoch"]
-        self._step_count = state_dict["_step_count"]
-
-
-# ---------------------------------------------------------------------
-# Distributed weighted sampler
-# ---------------------------------------------------------------------
-class WeightedDistributedSampler(Sampler):
-    """
-    Weighted sampler for distributed training.
-
-    We sample a global weighted list of indices and split it across ranks,
-    so each process gets a disjoint slice.
-    """
-
-    def __init__(
-        self,
-        weights: torch.Tensor,
-        num_samples: int,
-        replacement: bool = True,
-        generator=None,
-        rank: Optional[int] = None,
-        num_replicas: Optional[int] = None,
-    ) -> None:
-        if rank is None:
-            if not dist.is_initialized():
-                raise RuntimeError("DDP not initialized. Please provide `rank` manually.")
-            rank = dist.get_rank()
-
-        if num_replicas is None:
-            if not dist.is_initialized():
-                raise RuntimeError("DDP not initialized. Please provide `num_replicas` manually.")
-            num_replicas = dist.get_world_size()
-
-        self.weights = weights.clone().detach()
-        self.num_samples = num_samples
-        self.replacement = replacement
-        self.generator = generator
-        self.rank = rank
-        self.num_replicas = num_replicas
-
-        self.num_samples_per_rank = int(math.ceil(self.num_samples / self.num_replicas))
-        self.total_size = self.num_samples_per_rank * self.num_replicas
-
-    def __iter__(self):
-        generator = self.generator if self.generator is not None else torch.default_generator
-
-        indices = torch.multinomial(
-            self.weights,
-            self.total_size,
-            self.replacement,
-            generator=generator,
-        ).tolist()
-
-        indices_rank = indices[self.rank:self.total_size:self.num_replicas]
-        return iter(indices_rank)
-
-    def __len__(self):
-        return self.num_samples_per_rank
 
 
 # ---------------------------------------------------------------------
@@ -244,20 +97,23 @@ def save_checkpoint(
     epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler,
+    scheduler: UpdateWarmupCosineScheduler,
     best_metric: float,
+    best_metric_epoch: int,
+    non_improve_epochs: int,
     accelerator: Accelerator,
 ) -> None:
-    """
-    Save a full training checkpoint.
-    """
+    """Save model, optimizer, update scheduler, and early-stopping state."""
     torch.save(
         {
             "epoch": epoch,
+            "completed_updates": scheduler.completed_steps,
             "model_state_dict": accelerator.unwrap_model(model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_metric": best_metric,
+            "best_metric_epoch": best_metric_epoch,
+            "non_improve_epochs": non_improve_epochs,
         },
         path,
     )
@@ -282,30 +138,13 @@ def get_args():
     parser.add_argument("--val_modalities", nargs="+", type=str, default=None)
 
     parser.add_argument(
-        "--base_root",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/ms_data/MESO_V2.0/ALLSUBJS_2.0",
+        "--base_root", type=str, default=None,
+        help="Deprecated compatibility option; image paths are read from the metadata CSV.",
     )
-    parser.add_argument(
-        "--train_patient_ids",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/meta_data/updated_label_dataset/train_dataset_all.csv",
-    )
-    parser.add_argument(
-        "--train_diagnosis_df",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/ms-diagnosis/meta_data/updated_label_dataset/train_set.csv",
-    )
-    parser.add_argument(
-        "--val_patient_ids",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/meta_data/updated_label_dataset/validation_dataset_all.csv",
-    )
-    parser.add_argument(
-        "--white_matter_list",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/ms-diagnosis/meta_data/clinical_validation/ouput/0802/MESO_v2_WML_LLM_output_Qwen3_updated.csv",
-    )
+    parser.add_argument("--train_patient_ids", type=str, required=True, help="Training image metadata CSV.")
+    parser.add_argument("--train_diagnosis_df", type=str, required=True, help="Patient-level diagnosis CSV.")
+    parser.add_argument("--val_patient_ids", type=str, required=True, help="Validation image metadata CSV.")
+    parser.add_argument("--white_matter_list", type=str, required=True, help="Patient-level WM-lesion CSV.")
 
     parser.add_argument("--output_path", type=str, default="./outputs")
     parser.add_argument("--pretrained_path", type=str, default="pretrain_weights/VoCo/VoComni_B.pt")
@@ -345,6 +184,12 @@ def get_args():
     # LR scheduler
     # -----------------------------------------------------------------
     parser.add_argument("--warmup_epochs", type=int, default=1)
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=None,
+        help="Exact optimizer-update warmup length; overrides --warmup_epochs.",
+    )
     parser.add_argument("--warmup_start_lr", type=float, default=1e-6)
     parser.add_argument("--min_lr", type=float, default=1e-6)
     parser.add_argument("--use_warmup", action="store_true")
@@ -434,9 +279,9 @@ def prepare_datasets(args, logger, accelerator):
         args.val_modalities = args.modalities
 
     try:
-        train_df = pd.read_csv(args.train_patient_ids)
-        val_df = pd.read_csv(args.val_patient_ids)
-        white_matter_df = pd.read_csv(args.white_matter_list)
+        train_df = pd.read_csv(args.train_patient_ids, dtype={"m_id": "string"})
+        val_df = pd.read_csv(args.val_patient_ids, dtype={"m_id": "string"})
+        white_matter_df = pd.read_csv(args.white_matter_list, dtype={"m_id": "string"})
     except Exception as e:
         raise FileNotFoundError(f"Error loading dataset metadata: {e}")
 
@@ -468,7 +313,9 @@ def prepare_datasets(args, logger, accelerator):
         "other_demylin",
         "unspecified_demyelinating",
     ]
-    train_diagnosis_df = pd.read_csv(args.train_diagnosis_df, usecols=used_cols)
+    train_diagnosis_df = pd.read_csv(
+        args.train_diagnosis_df, usecols=used_cols, dtype={"m_id": "string"}
+    )
     train_df = train_df.merge(train_diagnosis_df, on="m_id", how="left", validate="m:1")
 
     flag_cols = used_cols[1:]
@@ -522,6 +369,8 @@ def prepare_datasets(args, logger, accelerator):
 
     train_df = train_df[train_df["label"].isin([0, 1])].copy()
     val_df = val_df[val_df["label"].isin([0, 1])].copy()
+    val_df = val_df.reset_index(drop=True)
+    val_df["row_id"] = np.arange(len(val_df), dtype=np.int64)
 
     # -----------------------------------------------------------------
     # Simple metadata filling
@@ -555,6 +404,7 @@ def prepare_datasets(args, logger, accelerator):
         "source",
     ]
     used_cols_val = [
+        "row_id",
         "m_id",
         "modality",
         "label",
@@ -681,48 +531,51 @@ def prepare_datasets(args, logger, accelerator):
 # Dataloaders
 # ---------------------------------------------------------------------
 def create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerator):
-    """
-    Build training and validation dataloaders.
-    """
+    """Build loaders once; Accelerate performs the only rank-level sharding."""
     world_size = accelerator.num_processes
+    batch_divisor = world_size * args.gradient_accumulation_steps
+    if args.batch_size % batch_divisor != 0:
+        raise ValueError(
+            "Global batch size must be divisible by "
+            f"num_processes * gradient_accumulation_steps ({batch_divisor})."
+        )
+    local_batch_size = args.batch_size // batch_divisor
 
+    sampler = None
     if args.oversampling and sampling_weights is not None:
-        sampler = WeightedDistributedSampler(
-            weights=torch.tensor(sampling_weights, dtype=torch.float),
+        generator = torch.Generator().manual_seed(args.seed)
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sampling_weights, dtype=torch.double),
             num_samples=len(sampling_weights),
             replacement=True,
-            rank=accelerator.process_index,
-            num_replicas=world_size,
+            generator=generator,
         )
-    else:
-        sampler = None
 
-    effective_batch_size = args.batch_size // world_size // args.gradient_accumulation_steps
-    effective_batch_size = max(effective_batch_size, 1)
-
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "persistent_workers": args.num_workers > 0,
+        "collate_fn": collate_skip_none,
+    }
     train_loader = DataLoader(
         train_ds,
-        batch_size=effective_batch_size,
+        batch_size=local_batch_size,
         shuffle=(sampler is None),
         sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=collate_skip_none,
         drop_last=True,
+        **loader_kwargs,
     )
 
-    val_dataloaders = {}
-    for modality, val_ds in val_datasets.items():
-        val_dataloaders[modality] = DataLoader(
+    val_dataloaders = {
+        modality: DataLoader(
             val_ds,
             batch_size=args.val_batch_size,
-            num_workers=args.num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=collate_skip_none,
             shuffle=False,
             drop_last=False,
+            **loader_kwargs,
         )
-
+        for modality, val_ds in val_datasets.items()
+    }
     return train_loader, val_dataloaders
 
 
@@ -823,14 +676,14 @@ def compute_saliency_regularization_losses(
     if effective_L1_weight != 0:
         l1_mask = batch_data["L1_mask"].squeeze(1)
         labels_broadcast = labels.view(labels.size(0), 1, 1, 1)
-        
+
         if args.pos_penalty: # penalty for positive labels
             penalty_map = torch.where(
                 labels_broadcast == 1,
                 F.relu(-aux_outputs),
                 F.relu(aux_outputs),
             )
-        
+
         else:
             penalty_map = torch.where(
                 labels_broadcast == 1,
@@ -849,7 +702,9 @@ def compute_saliency_regularization_losses(
 # ---------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------
-def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, args, epoch, writer=None):
+def train_one_epoch(
+    model, train_loader, optimizer, lr_scheduler, loss_function, accelerator, args, epoch, writer=None
+):
     """
     Train the model for one epoch.
 
@@ -872,6 +727,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, 
     total_l1_reg = 0.0
 
     step = 0
+    updates_this_epoch = 0
 
     if accelerator.is_main_process and use_saliency:
         print(
@@ -924,7 +780,10 @@ def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, 
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                optimizer.zero_grad()
+                if not accelerator.optimizer_step_was_skipped:
+                    lr_scheduler.step()
+                    updates_this_epoch += 1
+                optimizer.zero_grad(set_to_none=True)
 
         total_loss += loss.item()
         total_main_loss += main_loss.item()
@@ -932,7 +791,7 @@ def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, 
         total_l1_reg += reg_losses["L1_loss"].item()
 
         if writer is not None and step % 10 == 0:
-            global_step = epoch_len * epoch + step
+            global_step = epoch_len * (epoch - 1) + step
             writer.add_scalar("train/loss", loss.item(), global_step)
             writer.add_scalar("train/main_loss", main_loss.item(), global_step)
             writer.add_scalar("train/non_brain_reg_loss", reg_losses["non_brain_reg_loss"].item(), global_step)
@@ -942,12 +801,18 @@ def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, 
                 writer.add_scalar(f"train/lr_group_{i}", param_group["lr"], global_step)
 
 
-    denom = max(step, 1)
+    totals = torch.tensor(
+        [total_loss, total_main_loss, total_non_brain_reg, total_l1_reg, step],
+        dtype=torch.float64,
+        device=accelerator.device,
+    )
+    totals = accelerator.reduce(totals, reduction="sum")
+    denom = max(float(totals[4].item()), 1.0)
 
-    avg_loss = total_loss / denom
-    avg_main_loss = total_main_loss / denom
-    avg_non_brain_reg = total_non_brain_reg / denom
-    avg_l1_reg = total_l1_reg / denom
+    avg_loss = float(totals[0].item() / denom)
+    avg_main_loss = float(totals[1].item() / denom)
+    avg_non_brain_reg = float(totals[2].item() / denom)
+    avg_l1_reg = float(totals[3].item() / denom)
 
     if accelerator.is_main_process:
         print(
@@ -964,300 +829,168 @@ def train_one_epoch(model, train_loader, optimizer, loss_function, accelerator, 
         writer.add_scalar("train/epoch_non_brain_reg_loss", avg_non_brain_reg, epoch)
         writer.add_scalar("train/epoch_L1_loss", avg_l1_reg, epoch)
 
-    return avg_loss
+    return avg_loss, updates_this_epoch
 
 
 # ---------------------------------------------------------------------
 # Validate
 # ---------------------------------------------------------------------
 def validate_model(model, val_dataloaders, accelerator, args, logger):
-    """
-    Validate model across modality-specific dataloaders.
-
-    Returns:
-        results: dict with per-modality metrics and aggregated metrics.
-    """
+    """Run sharded validation and compute metrics from one globally gathered table."""
     accelerator.wait_for_everyone()
     model.eval()
-
-    results = {}
-
-    y_total_pred_list = []
-    y_total_list = []
-    m_id_total_list = []
-    modality_type_total_list = []
-
-    l1_pos_total_list = []
-    l1_neg_total_list = []
-    weighted_prob_sum_pos_total_list = []
-    weighted_prob_sum_neg_total_list = []
-
     use_saliency = is_saliency_backbone(args)
+    prediction_frames = []
+    expected_row_ids = []
 
-    with torch.no_grad():
-        raw_model = accelerator.unwrap_model(model)
+    raw_model = accelerator.unwrap_model(model)
+    if (
+        accelerator.is_main_process
+        and use_saliency
+        and hasattr(raw_model.encoder, "predictor")
+    ):
+        try:
+            logger.info(
+                "Classifier bias: %.8f",
+                raw_model.encoder.predictor.classifier_bias.item(),
+            )
+        except Exception:
+            pass
+    del raw_model
 
-        # Best-effort debug print for saliency backbones only
-        if use_saliency and hasattr(raw_model.encoder, "predictor"):
-            try:
-                print(f"Classifier bias: {raw_model.encoder.predictor.classifier_bias.item()}")
-            except Exception:
-                pass
-
-        del raw_model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
+    with torch.inference_mode():
         for modality, val_loader in val_dataloaders.items():
-            y_pred_all = []
-            y_all = []
-            m_id_all = []
-
-            l1_loss_all = []
-            weighted_prob_sum_all = []
-
-            is_smi_modality = False
-            try:
-                first_batch = next(iter(val_loader), None)
-                if first_batch is not None and "SMI" in first_batch and first_batch["SMI"][0] == 1:
-                    is_smi_modality = True
-            except Exception:
-                is_smi_modality = False
-            _ = is_smi_modality  # reserved in case you want modality-specific analysis later
+            modality_expected_ids = [
+                int(value) for value in val_loader.dataset.data["row_id"].tolist()
+            ]
+            expected_row_ids.extend(modality_expected_ids)
+            modality_frames = []
 
             for val_data in val_loader:
                 if val_data is None:
-                    continue
+                    raise RuntimeError(
+                        f"Validation produced an empty batch for modality {modality}."
+                    )
 
-                val_images = val_data["image"].to(accelerator.device)
-                val_labels = val_data["label"].to(accelerator.device)
-                m_id = val_data["m_id"]
+                val_images = val_data["image"].to(accelerator.device, non_blocking=True)
+                val_labels = val_data["label"].to(accelerator.device).reshape(-1)
+                row_ids = val_data["row_id"].to(accelerator.device).long().reshape(-1)
 
                 with accelerator.autocast():
-                    output_dict = model(val_images, train=True) # still use train=True in the validation setting
+                    output_dict = model(val_images, train=True)
                     score = output_dict["score"]
-
                     if use_saliency:
                         if args.loss_type == "bce":
-                            outputs = score.squeeze(1)
+                            probabilities = score.reshape(-1)
                         elif args.loss_type == "bce_with_logits":
-                            outputs = torch.sigmoid(score).squeeze(1)
+                            probabilities = torch.sigmoid(score).reshape(-1)
                         else:
-                            raise ValueError("VoCo_Salient_2 should use bce or bce_with_logits.")
-
-                        aux_outputs = output_dict["prob"]
-                        aux_sa_outputs = output_dict["SA_map"]
-
-                        if aux_outputs is not None:
-                            aux_outputs = aux_outputs.squeeze(1)
-
-                        if aux_sa_outputs is not None:
-                            aux_sa_outputs = aux_sa_outputs.mean(dim=1)
-
-                        if aux_outputs is not None:
-                            l1_loss = F.relu(aux_outputs).sum(dim=(1, 2, 3))
-                            l1_loss_all.append(accelerator.gather_for_metrics(l1_loss))
-
-                        if aux_outputs is not None and aux_sa_outputs is not None:
-                            weighted_prob_sum = (aux_outputs * aux_sa_outputs).sum(dim=(1, 2, 3))
-                            weighted_prob_sum_all.append(accelerator.gather_for_metrics(weighted_prob_sum))
-
+                            raise ValueError(
+                                "VoCo_Salient_2 validation requires bce or bce_with_logits."
+                            )
                     else:
-                        outputs = score
+                        probabilities = torch.softmax(score, dim=1)[:, 1]
 
-                y_pred_all.append(accelerator.gather_for_metrics(outputs))
-                y_all.append(accelerator.gather_for_metrics(val_labels))
-                m_id_all.extend(accelerator.gather_for_metrics(m_id))
+                l1_values = torch.full_like(probabilities, torch.nan)
+                weighted_values = torch.full_like(probabilities, torch.nan)
+                if use_saliency:
+                    probability_map = output_dict.get("prob")
+                    attention_map = output_dict.get("SA_map")
+                    if probability_map is not None:
+                        probability_map = probability_map.float().squeeze(1)
+                        l1_values = F.relu(probability_map).sum(dim=(1, 2, 3))
+                    if probability_map is not None and attention_map is not None:
+                        attention_map = attention_map.float().mean(dim=1)
+                        weighted_values = (probability_map * attention_map).sum(
+                            dim=(1, 2, 3)
+                        )
 
-            y_pred_gathered = (
-                torch.cat(y_pred_all, dim=0)
-                if y_pred_all else torch.empty(0, device=accelerator.device)
-            )
-            y_all_gathered = (
-                torch.cat(y_all, dim=0)
-                if y_all else torch.empty(0, device=accelerator.device)
-            )
-            modality_type = [modality] * len(m_id_all)
-
-            if use_saliency and len(y_all_gathered) > 0 and len(l1_loss_all) > 0:
-                pos_indices = y_all_gathered == 1
-                neg_indices = y_all_gathered == 0
-
-                l1_loss_gathered = torch.cat(l1_loss_all, dim=0)[pos_indices]
-                l1_loss_negative_gathered = torch.cat(l1_loss_all, dim=0)[neg_indices]
-
-                if len(weighted_prob_sum_all) > 0:
-                    weighted_prob_sum_gathered = torch.cat(weighted_prob_sum_all, dim=0)[pos_indices]
-                    weighted_prob_sum_negative_gathered = torch.cat(weighted_prob_sum_all, dim=0)[neg_indices]
-
-                    weighted_prob_sum_pos_total_list.append(weighted_prob_sum_gathered)
-                    weighted_prob_sum_neg_total_list.append(weighted_prob_sum_negative_gathered)
-
-                l1_pos_total_list.append(l1_loss_gathered)
-                l1_neg_total_list.append(l1_loss_negative_gathered)
+                gathered = accelerator.gather_for_metrics(
+                    {
+                        "row_id": row_ids,
+                        "ms": val_labels.long(),
+                        "ms_prob": probabilities.float(),
+                        "l1_sum": l1_values.float(),
+                        "weighted_prob_sum": weighted_values.float(),
+                    }
+                )
+                gathered_m_ids = accelerator.gather_for_metrics(
+                    [str(value) for value in val_data["m_id"]],
+                    use_gather_object=True,
+                )
 
                 if accelerator.is_main_process:
-                    print("=" * 100)
-                    print(f"{modality}, sum of activation map in positive cases: {l1_loss_gathered.mean().cpu().numpy():.4f}")
-                    print(f"{modality}, sum of activation map in negative cases: {l1_loss_negative_gathered.mean().cpu().numpy():.4f}")
-                    if len(weighted_prob_sum_all) > 0:
-                        print(f"{modality}, weighted sum of activation map in positive cases: {weighted_prob_sum_gathered.mean().cpu().numpy():.4f}")
-                        print(f"{modality}, weighted sum of activation map in negative cases: {weighted_prob_sum_negative_gathered.mean().cpu().numpy():.4f}")
-                    print("=" * 100)
+                    count = int(gathered["row_id"].numel())
+                    if len(gathered_m_ids) != count:
+                        raise RuntimeError(
+                            f"Gathered {count} tensors but {len(gathered_m_ids)} IDs."
+                        )
+                    modality_frames.append(
+                        pd.DataFrame(
+                            {
+                                "row_id": gathered["row_id"].detach().cpu().numpy(),
+                                "m_id": [str(value) for value in gathered_m_ids],
+                                "modality": [modality] * count,
+                                "ms": gathered["ms"].detach().cpu().numpy(),
+                                "ms_prob": gathered["ms_prob"].detach().cpu().numpy(),
+                                "l1_sum": gathered["l1_sum"].detach().cpu().numpy(),
+                                "weighted_prob_sum": gathered["weighted_prob_sum"].detach().cpu().numpy(),
+                            }
+                        )
+                    )
 
-            if accelerator.is_main_process and len(y_all_gathered) > 0:
+            if accelerator.is_main_process and modality_expected_ids:
+                if not modality_frames:
+                    raise RuntimeError(f"No validation predictions for modality {modality}.")
+                modality_frame = validate_prediction_coverage(
+                    pd.concat(modality_frames, ignore_index=True),
+                    expected_row_ids=modality_expected_ids,
+                )
+                prediction_frames.append(modality_frame)
+
+                positives = modality_frame[modality_frame["ms"] == 1]
+                negatives = modality_frame[modality_frame["ms"] == 0]
                 if use_saliency:
-                    acc_value = torch.eq(y_pred_gathered > 0.5, y_all_gathered)
-                else:
-                    acc_value = torch.eq(y_pred_gathered.argmax(dim=1), y_all_gathered)
-
-                acc_metric = acc_value.sum().item() / len(acc_value)
-
-                try:
-                    if use_saliency:
-                        y_pred_prob = y_pred_gathered.cpu().numpy()
-                    else:
-                        y_pred_prob = y_pred_gathered.softmax(dim=1)[:, 1].cpu().numpy()
-
-                    y_true = y_all_gathered.cpu().numpy()
-
-                    if len(set(y_true.tolist())) < 2:
-                        auc_result = 0.5
-                        logger.warning(f"Modality {modality} has only one class. AUC set to 0.5.")
-                    else:
-                        auc_result = roc_auc_score(y_true, y_pred_prob)
-                except Exception as e:
-                    logger.error(f"Error computing AUC for {modality}: {str(e)}")
-                    auc_result = 0.5
-
-                results[modality] = {
-                    "accuracy": acc_metric,
-                    "auc": auc_result,
-                    "count": len(y_all_gathered),
-                }
-
-                y_total_pred_list.append(y_pred_gathered)
-                y_total_list.append(y_all_gathered)
-                m_id_total_list.extend(m_id_all)
-                modality_type_total_list.extend(modality_type)
+                    if not positives.empty:
+                        logger.info(
+                            "[%s] positive activation sum=%.4f, weighted sum=%.4f",
+                            modality,
+                            positives["l1_sum"].mean(),
+                            positives["weighted_prob_sum"].mean(),
+                        )
+                    if not negatives.empty:
+                        logger.info(
+                            "[%s] negative activation sum=%.4f, weighted sum=%.4f",
+                            modality,
+                            negatives["l1_sum"].mean(),
+                            negatives["weighted_prob_sum"].mean(),
+                        )
 
             accelerator.wait_for_everyone()
 
-    if accelerator.is_main_process and len(y_total_list) > 0:
-        y_total_pred = torch.cat(y_total_pred_list, dim=0)
-        y_total = torch.cat(y_total_list, dim=0)
-
-        if use_saliency:
-            acc_value = torch.eq(y_total_pred > 0.5, y_total)
-            y_pred_prob = y_total_pred.cpu().numpy()
-        else:
-            acc_value = torch.eq(y_total_pred.argmax(dim=1), y_total)
-            y_pred_prob = y_total_pred.softmax(dim=1)[:, 1].cpu().numpy()
-
-        total_acc = acc_value.sum().item() / len(acc_value)
-        y_true = y_total.cpu().numpy()
-
-        try:
-            total_auc = 0.5 if len(set(y_true.tolist())) < 2 else roc_auc_score(y_true, y_pred_prob)
-        except Exception as e:
-            logger.error(f"Error computing combined AUC: {str(e)}")
-            total_auc = 0.5
-
-        results["total"] = {"accuracy": total_acc, "auc": total_auc, "count": len(y_total)}
-
-        results_df = pd.DataFrame(
-            {
-                "m_id": m_id_total_list,
-                "modality": modality_type_total_list,
-                "ms_prob": y_pred_prob,
-                "ms": y_true,
-            }
+    results = {}
+    if accelerator.is_main_process:
+        if not prediction_frames:
+            raise RuntimeError("Validation generated no predictions.")
+        predictions = validate_prediction_coverage(
+            pd.concat(prediction_frames, ignore_index=True),
+            expected_row_ids=expected_row_ids,
         )
-
-        _, ensemble_acc, ensemble_auc, _, _ = grouped_avg_prob_ensemble(
-            results_df,
-            print_result=True,
-            return_metrics=True,
+        results = summarize_validation_predictions(
+            predictions,
+            requested_modalities=args.val_modalities,
+            auc_metric=args.auc_metric,
+            expected_row_ids=expected_row_ids,
         )
-
-        total_samples = sum(
-            r["count"] for r in results.values()
-            if isinstance(r, dict) and "count" in r
-        )
-
-        micro_avg_acc = (
-            sum(r["accuracy"] * r["count"] for r in results.values() if isinstance(r, dict) and "count" in r)
-            / total_samples
-            if total_samples > 0 else 0
-        )
-        micro_avg_auc = (
-            sum(r["auc"] * r["count"] for r in results.values() if isinstance(r, dict) and "count" in r)
-            / total_samples
-            if total_samples > 0 else 0
-        )
-
-        results["micro_avg"] = {"accuracy": micro_avg_acc, "auc": micro_avg_auc}
-        results["ensemble"] = {"accuracy": ensemble_acc, "auc": ensemble_auc}
-
-        # -------------------------------------------------------------
-        # Hierarchical averaging
-        # -------------------------------------------------------------
-        hierarchical_avg_auc = 0.0
-
-        hierarchy = {
-            "FLAIR": ["3DFLAIR_NCE", "3DFLAIR_CE", "2DFLAIR_NCE", "2DFLAIR_CE"],
-            "T1": ["3DT1_NCE", "2DT1_NCE"],
-            "T1CE": ["3DT1_CE", "2DT1_CE"],
-            "b0": ["b0"],
-            "DTI": ["fa_dti", "md_dti", "ad_dti", "rd_dti"],
-            "SMI": ["f_smi", "p2_smi", "DePerp_smi", "DePar_smi", "Da_smi"],
-            "DKI": ["ak_wdki", "mk_wdki", "rk_wdki"],
-        }
-
-        second_level_hierarchy = {
-            "sMRI": ["FLAIR", "T1", "T1CE", "b0"],
-            "dMRI": ["DTI", "DKI", "SMI"],
-        }
-
-        hierarchical_aucs = {}
-
-        for group, modalities in hierarchy.items():
-            aucs_in_group = [results[m]["auc"] for m in modalities if m in results and results[m]["count"] > 0]
-            if len(aucs_in_group) > 0:
-                hierarchical_aucs[group] = sum(aucs_in_group) / len(aucs_in_group)
-
-        for group, sub_groups in second_level_hierarchy.items():
-            aucs_in_group = [hierarchical_aucs[sg] for sg in sub_groups if sg in hierarchical_aucs]
-            if len(aucs_in_group) > 0:
-                hierarchical_aucs[group] = sum(aucs_in_group) / len(aucs_in_group)
-
-        final_level_aucs = [hierarchical_aucs[g] for g in ["sMRI", "dMRI"] if g in hierarchical_aucs]
-        if len(final_level_aucs) > 0:
-            hierarchical_avg_auc = sum(final_level_aucs) / len(final_level_aucs)
-
-        results["hierarchical_aucs"] = hierarchical_aucs
-        results["hierarchical_avg_auc"] = hierarchical_avg_auc
-
         logger.info(
-            f"Micro Avg AUC: {micro_avg_auc:.4f} | "
-            f"Macro Avg AUC: {total_auc:.4f} | "
-            f"Hierarchical Avg AUC: {hierarchical_avg_auc:.4f} | "
-            f"Ensemble AUC: {ensemble_auc:.4f}"
+            "Validation micro AUC=%.4f | macro AUC=%.4f | hierarchical AUC=%.4f | ensemble AUC=%.4f",
+            results["micro_avg"]["auc"],
+            results["macro_avg"]["auc"],
+            results["hierarchical_avg_auc"],
+            results["ensemble"]["auc"],
         )
-        logger.info(f"Hierarchical breakdown: {hierarchical_aucs}")
 
-        if args.auc_metric == "micro":
-            results["best_metric"] = micro_avg_auc
-        elif args.auc_metric == "macro":
-            results["best_metric"] = total_auc
-        elif args.auc_metric == "hierarchical":
-            results["best_metric"] = hierarchical_avg_auc
-        elif args.auc_metric == "ensemble":
-            results["best_metric"] = ensemble_auc
-        else:
-            logger.warning(f"Unknown auc_metric '{args.auc_metric}'. Defaulting to hierarchical.")
-            results["best_metric"] = hierarchical_avg_auc
-
+    accelerator.wait_for_everyone()
     return results
 
 
@@ -1265,16 +998,7 @@ def validate_model(model, val_dataloaders, accelerator, args, logger):
 # Main
 # ---------------------------------------------------------------------
 def main(args):
-    """
-    Main training entry point.
-
-    High-level workflow:
-        1) Initialize accelerator and logging
-        2) Prepare datasets and dataloaders
-        3) Build model / optimizer / scheduler
-        4) Train + validate
-        5) Save checkpoints and best model
-    """
+    """Train with global validation gathering and update-based LR scheduling."""
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=args.find_unused_parameters
     )
@@ -1289,53 +1013,46 @@ def main(args):
     logging_level = logging.INFO if accelerator.is_main_process else logging.ERROR
     logging.basicConfig(stream=sys.stdout, level=logging_level)
 
-    monai.config.print_config()
+    if accelerator.is_main_process:
+        monai.config.print_config()
     set_random_seed(args.seed)
 
     if accelerator.is_main_process:
-        logger.info(f"Random seed: {args.seed}")
-        logger.info(f"Backbone: {args.backbone}")
-        logger.info(f"Modalities: {args.modalities}")
-        logger.info(f"Batch size: {args.batch_size}")
-        logger.info(f"LR: {args.lr}")
-        logger.info(f"Mixed precision: {args.mixed_precision}")
-        logger.info(f"Gradient accumulation steps: {args.gradient_accumulation_steps}")
-        logger.info(f"Number of GPUs: {accelerator.num_processes}")
-        logger.info(f"Number of epochs: {args.num_epochs}")
-        logger.info(f"AUC metric: {args.auc_metric}")
-        if is_saliency_backbone(args):
-            logger.info(f"Outside reg loss: {args.outside_reg_loss}")
-            logger.info(f"L1 loss: {args.L1_loss}")
-            logger.info(f"Num heads: {args.num_heads}")
+        logger.info("Random seed: %s", args.seed)
+        logger.info("Backbone: %s", args.backbone)
+        logger.info("Modalities: %s", args.modalities)
+        logger.info("Global batch size: %s", args.batch_size)
+        logger.info("Base LR: %s", args.lr)
+        logger.info("Mixed precision: %s", args.mixed_precision)
+        logger.info("Gradient accumulation steps: %s", args.gradient_accumulation_steps)
+        logger.info("Number of processes: %s", accelerator.num_processes)
+        logger.info("Number of epochs: %s", args.num_epochs)
+        logger.info("Checkpoint-selection metric: %s", args.auc_metric)
 
-    # -------------------------------------------------------------
-    # Dataset / dataloader
-    # -------------------------------------------------------------
-    train_ds, val_datasets, sampling_weights, image_size = prepare_datasets(args, logger, accelerator)
-    train_loader, val_dataloaders = create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerator)
+    train_ds, val_datasets, sampling_weights, image_size = prepare_datasets(
+        args, logger, accelerator
+    )
+    train_loader, val_dataloaders = create_dataloaders(
+        train_ds, val_datasets, sampling_weights, args, accelerator
+    )
 
-    check_data = first(train_loader)
-    if check_data is not None and accelerator.is_main_process:
-        logger.info("Training data check:")
-        logger.info(f"Image shape: {check_data['image'].shape}")
-        logger.info(f"Label: {check_data['label']}")
-        logger.info(f"Modality: {check_data['modality']}")
-    elif accelerator.is_main_process:
-        logger.warning("No training batch available for inspection.")
-
-    # -------------------------------------------------------------
-    # Output directories
-    # -------------------------------------------------------------
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp_holder = [
+        datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        if accelerator.is_main_process
+        else None
+    ]
+    broadcast_object_list(timestamp_holder)
+    timestamp = timestamp_holder[0]
     if args.fold is not None:
         timestamp += f"_{args.fold}"
 
     processing_tag = (
-        "preprocess" if args.use_preprocess else
-        "bet_only" if args.use_bet_only else
-        "non_preprocess"
+        "preprocess"
+        if args.use_preprocess
+        else "bet_only"
+        if args.use_bet_only
+        else "non_preprocess"
     )
-
     experiment_name = (
         f"{args.backbone}_{processing_tag}_"
         f"{'_'.join(args.modalities)}_"
@@ -1343,13 +1060,12 @@ def main(args):
         f"lr{args.lr}_bs{args.batch_size}_ep{args.num_epochs}"
     )
     output_path = os.path.join(args.output_path, experiment_name, timestamp)
-    os.makedirs(output_path, exist_ok=True)
-
     if accelerator.is_main_process:
-        logger.info(f"Output path: {output_path}")
+        os.makedirs(output_path, exist_ok=True)
+        logger.info("Output path: %s", output_path)
+    accelerator.wait_for_everyone()
 
     writer = SummaryWriter(log_dir=output_path) if accelerator.is_main_process else None
-
     if WANDB_AVAILABLE and accelerator.is_main_process and args.use_wandb:
         wandb.init(
             project="medical-image-classification",
@@ -1357,9 +1073,6 @@ def main(args):
             config=vars(args),
         )
 
-    # -------------------------------------------------------------
-    # Model
-    # -------------------------------------------------------------
     model = VisualEncoder(
         encoder_name=args.backbone,
         in_channels=args.num_channels,
@@ -1368,120 +1081,155 @@ def main(args):
         pretrained_path=args.pretrained_path,
         num_heads=args.num_heads,
     )
-
     if args.freeze_backbone:
-        for name, param in model.named_parameters():
+        for name, parameter in model.named_parameters():
             if "classifier" not in name:
-                param.requires_grad = False
+                parameter.requires_grad = False
         if accelerator.is_main_process:
-            logger.info("Backbone frozen. Only classifier-related parameters will be trained.")
+            logger.info("Backbone frozen; only classifier parameters will be trained.")
 
     loss_function = build_loss_function(args, train_ds, logger)
-
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        filter(lambda parameter: parameter.requires_grad, model.parameters()),
         lr=args.lr,
     )
-
-    if args.use_warmup:
-        lr_scheduler = WarmupCosineScheduler(
-            optimizer=optimizer,
-            warmup_epochs=args.warmup_epochs,
-            total_epochs=args.num_epochs,
-            min_lr=args.min_lr,
-            warmup_start_lr=args.warmup_start_lr,
-            verbose=(accelerator.is_main_process and args.num_epochs <= 20),
-        )
-    else:
-        lr_scheduler = CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=args.num_epochs,
-            eta_min=args.min_lr,
-        )
 
     start_epoch = 1
     best_metric = -1.0
     best_metric_epoch = 0
     non_improve_epochs = 0
-
+    checkpoint = None
     if args.continue_training is not None:
         if accelerator.is_main_process:
-            logger.info(f"Resuming from checkpoint: {args.continue_training}")
-
-        checkpoint = torch.load(args.continue_training, map_location="cpu", weights_only=False)
+            logger.info("Resuming from checkpoint: %s", args.continue_training)
+        checkpoint = torch.load(
+            args.continue_training, map_location="cpu", weights_only=False
+        )
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        best_metric = checkpoint.get("best_metric", -1.0)
+        start_epoch = int(checkpoint["epoch"]) + 1
+        best_metric = float(checkpoint.get("best_metric", -1.0))
+        best_metric_epoch = int(
+            checkpoint.get("best_metric_epoch", checkpoint.get("epoch", 0))
+        )
+        non_improve_epochs = int(checkpoint.get("non_improve_epochs", 0))
 
-        if "scheduler_state_dict" in checkpoint:
-            try:
-                lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            except Exception as e:
-                if accelerator.is_main_process:
-                    logger.warning(f"Could not load scheduler state: {e}")
-
-        start_epoch = checkpoint["epoch"] + 1
-        best_metric_epoch = checkpoint["epoch"]
-
-    # -------------------------------------------------------------
-    # Accelerator prepare
-    # -------------------------------------------------------------
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-
     for modality, val_dataloader in val_dataloaders.items():
         val_dataloaders[modality] = accelerator.prepare(val_dataloader)
 
-    # -------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------
-    for epoch in range(start_epoch, args.num_epochs + 1):
-        lr_scheduler.step()
+    if len(train_loader) == 0:
+        raise RuntimeError("Training dataloader contains zero batches.")
+    updates_per_epoch, total_updates = compute_optimizer_update_counts(
+        num_batches_per_process=len(train_loader),
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        num_epochs=args.num_epochs,
+    )
+    if args.warmup_steps is not None:
+        warmup_updates = args.warmup_steps
+    elif args.use_warmup:
+        warmup_updates = args.warmup_epochs * updates_per_epoch
+    else:
+        warmup_updates = 0
 
+    # Checkpoints store the current optimizer LR. Reset the schedule's base LR
+    # before constructing it; loading scheduler state below restores the exact
+    # next-update LR for new-format checkpoints.
+    for parameter_group in optimizer.param_groups:
+        parameter_group["lr"] = args.lr
+    lr_scheduler = UpdateWarmupCosineScheduler(
+        optimizer,
+        total_steps=total_updates,
+        warmup_steps=warmup_updates,
+        min_lr=args.min_lr,
+        warmup_start_lr=args.warmup_start_lr,
+    )
+
+    if checkpoint is not None:
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if (
+            isinstance(scheduler_state, dict)
+            and scheduler_state.get("state_version")
+            == UpdateWarmupCosineScheduler.state_version
+        ):
+            lr_scheduler.load_state_dict(scheduler_state)
+        else:
+            completed_updates = int(
+                checkpoint.get(
+                    "completed_updates", (start_epoch - 1) * updates_per_epoch
+                )
+            )
+            lr_scheduler.set_completed_steps(completed_updates)
+            if accelerator.is_main_process:
+                logger.warning(
+                    "Converted a legacy epoch scheduler at completed update %d.",
+                    completed_updates,
+                )
+
+    if accelerator.is_main_process:
+        logger.info(
+            "Update schedule: updates_per_epoch=%d total_updates=%d warmup_updates=%d current_update=%d current_lr=%.8f",
+            updates_per_epoch,
+            total_updates,
+            warmup_updates,
+            lr_scheduler.completed_steps,
+            lr_scheduler.get_last_lr()[0],
+        )
+
+    for epoch in range(start_epoch, args.num_epochs + 1):
         if accelerator.is_main_process:
             logger.info("-" * 60)
-            logger.info(f"Epoch {epoch}/{args.num_epochs}")
-            logger.info(f"Current learning rate: {lr_scheduler.get_last_lr()[0]:.8f}")
+            logger.info("Epoch %d/%d", epoch, args.num_epochs)
+            logger.info(
+                "Starting LR %.8f at update %d",
+                lr_scheduler.get_last_lr()[0],
+                lr_scheduler.completed_steps,
+            )
 
-        cur_lr = torch.tensor([optimizer.param_groups[0]["lr"]], device=accelerator.device, dtype=torch.float64)
-        all_lrs = accelerator.gather_for_metrics(cur_lr)
-        if accelerator.is_main_process:
-            lr_str = [f"{x:.8f}" for x in all_lrs.cpu().tolist()]
-            logger.info(f"[All ranks LR] {lr_str}")
-
-        epoch_loss = train_one_epoch(
+        epoch_loss, updates_this_epoch = train_one_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
             loss_function=loss_function,
             accelerator=accelerator,
             args=args,
             epoch=epoch,
             writer=writer,
         )
-
+        if updates_this_epoch <= 0:
+            raise RuntimeError(f"Epoch {epoch} completed without an optimizer update.")
 
         if accelerator.is_main_process:
-            logger.info(f"Epoch {epoch} average loss: {epoch_loss:.4f}")
-
+            logger.info(
+                "Epoch %d average loss %.4f | successful updates %d | next LR %.8f",
+                epoch,
+                epoch_loss,
+                updates_this_epoch,
+                lr_scheduler.get_last_lr()[0],
+            )
             if writer is not None:
                 writer.add_scalar("train/epoch_loss", epoch_loss, epoch)
-                writer.add_scalar("train/learning_rate", lr_scheduler.get_last_lr()[0], epoch)
-
+                writer.add_scalar(
+                    "train/learning_rate", lr_scheduler.get_last_lr()[0], epoch
+                )
+                writer.add_scalar(
+                    "train/completed_updates", lr_scheduler.completed_steps, epoch
+                )
             if WANDB_AVAILABLE and args.use_wandb:
                 wandb.log(
                     {
                         "epoch": epoch,
                         "train/loss": epoch_loss,
                         "train/lr": lr_scheduler.get_last_lr()[0],
+                        "train/completed_updates": lr_scheduler.completed_steps,
                     }
                 )
 
         if torch.cuda.is_available():
             log_peak_memory_usage(accelerator)
 
-        # ---------------------------------------------------------
-        # Validation
-        # ---------------------------------------------------------
+        should_stop = False
         if epoch % args.val_interval == 0:
             val_results = validate_model(
                 model=model,
@@ -1490,60 +1238,51 @@ def main(args):
                 args=args,
                 logger=logger,
             )
-
             if accelerator.is_main_process:
-                for modality, metrics in val_results.items():
-                    if modality in ["total", "micro_avg", "hierarchical_aucs", "hierarchical_avg_auc", "best_metric", "ensemble"]:
+                for modality in args.val_modalities:
+                    if modality not in val_results:
                         continue
-
+                    metrics = val_results[modality]
                     logger.info(
-                        f"Modality {modality}: "
-                        f"accuracy={metrics.get('accuracy', 0):.4f}, "
-                        f"auc={metrics.get('auc', 0):.4f}, "
-                        f"count={metrics.get('count', 0)}"
+                        "Modality %s: accuracy=%.4f, auc=%.4f, count=%d",
+                        modality,
+                        metrics["accuracy"],
+                        metrics["auc"],
+                        metrics["count"],
                     )
-
                     if writer is not None:
-                        writer.add_scalar(f"val/{modality}/accuracy", metrics.get("accuracy", 0), epoch)
-                        writer.add_scalar(f"val/{modality}/auc", metrics.get("auc", 0), epoch)
-
-                    if WANDB_AVAILABLE and args.use_wandb:
-                        wandb.log(
-                            {
-                                f"val/{modality}/accuracy": metrics.get("accuracy", 0),
-                                f"val/{modality}/auc": metrics.get("auc", 0),
-                                "epoch": epoch,
-                            }
+                        writer.add_scalar(
+                            f"val/{modality}/accuracy", metrics["accuracy"], epoch
+                        )
+                        writer.add_scalar(
+                            f"val/{modality}/auc", metrics["auc"], epoch
                         )
 
-                if "total" in val_results:
+                for metric_name in ("micro_avg", "macro_avg", "ensemble"):
+                    metrics = val_results[metric_name]
                     logger.info(
-                        f"Total: accuracy={val_results['total'].get('accuracy', 0):.4f}, "
-                        f"auc={val_results['total'].get('auc', 0):.4f}"
+                        "%s: accuracy=%.4f, auc=%.4f",
+                        metric_name,
+                        metrics["accuracy"],
+                        metrics["auc"],
                     )
                     if writer is not None:
-                        writer.add_scalar("val/total/accuracy", val_results["total"].get("accuracy", 0), epoch)
-                        writer.add_scalar("val/total/auc", val_results["total"].get("auc", 0), epoch)
+                        writer.add_scalar(
+                            f"val/{metric_name}/accuracy", metrics["accuracy"], epoch
+                        )
+                        writer.add_scalar(
+                            f"val/{metric_name}/auc", metrics["auc"], epoch
+                        )
+                logger.info(
+                    "hierarchical_avg: auc=%.4f",
+                    val_results["hierarchical_avg_auc"],
+                )
 
-                if "micro_avg" in val_results:
-                    logger.info(
-                        f"Micro-average: accuracy={val_results['micro_avg'].get('accuracy', 0):.4f}, "
-                        f"auc={val_results['micro_avg'].get('auc', 0):.4f}"
-                    )
-                    if writer is not None:
-                        writer.add_scalar("val/micro_avg/accuracy", val_results["micro_avg"].get("accuracy", 0), epoch)
-                        writer.add_scalar("val/micro_avg/auc", val_results["micro_avg"].get("auc", 0), epoch)
-
-                if "hierarchical_avg_auc" in val_results:
-                    logger.info(f"Hierarchical-average AUC: {val_results['hierarchical_avg_auc']:.4f}")
-
-                current_metric = val_results.get("best_metric", 0.0)
-
+                current_metric = float(val_results["best_metric"])
                 if current_metric > best_metric:
                     non_improve_epochs = 0
                     best_metric = current_metric
                     best_metric_epoch = epoch
-
                     torch.save(
                         accelerator.unwrap_model(model).state_dict(),
                         os.path.join(output_path, "best_model.pth"),
@@ -1557,10 +1296,13 @@ def main(args):
                     non_improve_epochs += 1
 
                 logger.info(
-                    f"Epoch {epoch} | current {args.auc_metric} metric={current_metric:.4f}, "
-                    f"best={best_metric:.4f} at epoch {best_metric_epoch}"
+                    "Epoch %d | current %s=%.4f, best=%.4f at epoch %d",
+                    epoch,
+                    args.auc_metric,
+                    current_metric,
+                    best_metric,
+                    best_metric_epoch,
                 )
-
                 if WANDB_AVAILABLE and args.use_wandb:
                     wandb.log(
                         {
@@ -1569,16 +1311,8 @@ def main(args):
                             "epoch": epoch,
                         }
                     )
+                should_stop = non_improve_epochs >= args.early_stopping_epochs
 
-                if non_improve_epochs >= args.early_stopping_epochs:
-                    logger.info(
-                        f"Early stopping triggered after {non_improve_epochs} epochs without improvement."
-                    )
-                    break
-
-        # ---------------------------------------------------------
-        # Periodic checkpoint
-        # ---------------------------------------------------------
         if accelerator.is_main_process and epoch % args.save_interval == 0:
             save_checkpoint(
                 path=os.path.join(output_path, f"checkpoint_epoch_{epoch}.pth"),
@@ -1587,31 +1321,46 @@ def main(args):
                 optimizer=optimizer,
                 scheduler=lr_scheduler,
                 best_metric=best_metric,
+                best_metric_epoch=best_metric_epoch,
+                non_improve_epochs=non_improve_epochs,
                 accelerator=accelerator,
             )
 
-    # -------------------------------------------------------------
-    # Finish
-    # -------------------------------------------------------------
-    if accelerator.is_main_process:
-        logger.info(f"Training completed. Best metric={best_metric:.4f} at epoch={best_metric_epoch}")
+        stop_tensor = torch.tensor(
+            int(should_stop), device=accelerator.device, dtype=torch.int32
+        )
+        stop_tensor = accelerator.reduce(stop_tensor, reduction="sum")
+        if int(stop_tensor.item()) > 0:
+            if accelerator.is_main_process:
+                logger.info(
+                    "Early stopping synchronized across all ranks after %d non-improving validations.",
+                    non_improve_epochs,
+                )
+            break
 
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        logger.info(
+            "Training completed. Best metric=%.4f at epoch=%d; completed updates=%d",
+            best_metric,
+            best_metric_epoch,
+            lr_scheduler.completed_steps,
+        )
         torch.save(
             accelerator.unwrap_model(model).state_dict(),
             os.path.join(output_path, "final_model.pth"),
         )
-
         if writer is not None:
             writer.close()
-
         if WANDB_AVAILABLE and args.use_wandb:
             wandb.finish()
 
+    accelerator.wait_for_everyone()
     accelerator.free_memory()
-
     return {
         "best_metric": best_metric,
         "best_epoch": best_metric_epoch,
+        "completed_updates": lr_scheduler.completed_steps,
         "output_path": output_path,
     }
 

@@ -1,6 +1,6 @@
-import sys
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -8,7 +8,6 @@ import ants
 import numpy as np
 import pandas as pd
 import torch
-
 
 ORDER = [
     "3DFLAIR_NCE", "3DFLAIR_CE", "2DFLAIR_NCE", "2DFLAIR_CE",
@@ -82,7 +81,8 @@ def read_img_reorient(path: Path, pixeltype: Optional[str] = None) -> ants.ANTsI
 
 def run_hdbet(input_file: Path, out_prefix: Path) -> None:
     result = subprocess.run(
-        ["hd-bet", "-i", str(input_file), "-o", str(out_prefix), "-device", "0"],
+        ["hd-bet", "-i", str(input_file), "-o", str(out_prefix),
+         "-device", "cuda", "--save_bet_mask"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -95,14 +95,14 @@ def run_hdbet(input_file: Path, out_prefix: Path) -> None:
 def brain_extraction(img_path: Path, bet_dir: Path, out_prefix_name: str, skip_exist: bool = False) -> Tuple[Path, Path]:
     bet_dir.mkdir(parents=True, exist_ok=True)
     skull = bet_dir / f"{out_prefix_name}.nii.gz"
-    mask = bet_dir / f"{out_prefix_name}_mask.nii.gz"
+    mask = bet_dir / f"{out_prefix_name}_bet.nii.gz"
 
     if skip_exist and skull.exists() and mask.exists():
         log(f"  [BET] skip existing {out_prefix_name}")
         return skull, mask
 
     log(f"  [BET] running on {out_prefix_name}")
-    run_hdbet(img_path, bet_dir / out_prefix_name)
+    run_hdbet(img_path, skull)
     return skull, mask
 
 
@@ -594,8 +594,8 @@ def preprocess_patient(
     df_out = df.copy()
     df_out["plane_group"] = "MAIN"
     df_out["debias"] = pd.NA
-    df_out["BET"] = pd.NA
-    df_out["preprocessed"] = pd.NA
+    df_out["bet"] = pd.NA
+    df_out["preprocessing"] = pd.NA
 
     final_mask_path_for_patient: Optional[str] = None
 
@@ -640,8 +640,8 @@ def preprocess_patient(
 
             df_out.loc[mod_rows, "plane_group"] = record["plane_group"]
             df_out.loc[mod_rows, "debias"] = record["debias"]
-            df_out.loc[mod_rows, "BET"] = record["BET"]
-            df_out.loc[mod_rows, "preprocessed"] = record["preprocessed"]
+            df_out.loc[mod_rows, "bet"] = record["BET"]
+            df_out.loc[mod_rows, "preprocessing"] = record["preprocessed"]
 
         if mask_preprocessed_path is not None:
             final_mask_path_for_patient = mask_preprocessed_path
@@ -659,14 +659,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", required=True, help="CSV with modality table")
     parser.add_argument("--dataset", default=None, type=str, help="Dataset name filter")
-    parser.add_argument(
-        "--template",
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/MRI-preprocessing-techniques/assets/templates/mni_icbm152_t1_tal_nlin_sym_09a.nii",
-    )
-    parser.add_argument(
-        "--tpl_mask",
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/code/MRI-preprocessing-techniques/assets/templates/mni_icbm152_t1_tal_nlin_sym_09a_mask.nii",
-    )
+    parser.add_argument("--template", required=True, help="MNI template NIfTI.")
+    parser.add_argument("--tpl_mask", required=True, help="Template brain-mask NIfTI.")
     parser.add_argument("--out_dir", required=True, help="Output directory")
     parser.add_argument("--manifest_name", default="preprocessing_manifest.csv", help="Output manifest CSV filename")
 

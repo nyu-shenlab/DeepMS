@@ -1,26 +1,17 @@
-import torch.nn as nn
-import torch
-from monai.networks.blocks import UnetrUpBlock, UnetOutBlock
+import os
+import sys
 
 # Copyright (c) 2015-present, Facebook, Inc.
 # All rights reserved.
-from collections import OrderedDict
-from distutils.fancy_getopt import FancyGetopt
-from re import M
+from functools import partial
+
 import torch
 import torch.nn as nn
-from functools import partial
-import torch.nn.functional as F
-import math
-from timm.models.vision_transformer import _cfg
-from timm.models.registry import register_model
-from timm.models.layers import trunc_normal_, DropPath, to_2tuple
-
-from monai.networks.blocks import UnetrBasicBlock, UnetrPrUpBlock, UnetrUpBlock
+from monai.networks.blocks import UnetrUpBlock
 from monai.networks.blocks.dynunet_block import UnetOutBlock
+from timm.layers import DropPath
+from timm.models.vision_transformer import _cfg
 
-import sys
-import os
 sys.path.append(os.getcwd())
 
 
@@ -65,7 +56,7 @@ class CMlp(nn.Module):
         x = self.drop(x)
         return x
 
-    
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
@@ -150,8 +141,8 @@ class SABlock(nn.Module):
             x = x + self.drop_path(self.attn(self.norm1(x)))
             x = x + self.drop_path(self.mlp(self.norm2(x)))
         x = x.transpose(1, 2).reshape(B, C, D, H, W )
-        return x        
-   
+        return x
+
 
 class head_embedding(nn.Module):
     def __init__(self, in_channels, out_channels, stride=2):
@@ -215,8 +206,8 @@ class PatchEmbed(nn.Module):
         x = self.norm(x)
         x = x.reshape(B, D, H, W, -1).permute(0, 4, 1, 2, 3).contiguous()
         return x
-    
-    
+
+
 class UniFormer(nn.Module):
     """ Vision Transformer
     A PyTorch impl of : `An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale`  -
@@ -246,7 +237,7 @@ class UniFormer(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6) 
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         if conv_stem:
             self.patch_embed1 = head_embedding(in_channels=in_chans, out_channels=embed_dim[0])
             self.patch_embed2 = middle_embedding(in_channels=embed_dim[0], out_channels=embed_dim[1])
@@ -287,7 +278,7 @@ class UniFormer(nn.Module):
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i+depth[0]+depth[1]+depth[2]], norm_layer=norm_layer)
             for i in range(depth[3])])
         self.norm = nn.BatchNorm3d(embed_dim[-1])
-    
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -353,7 +344,7 @@ def uniformer_small(**kwargs):
         depth=[3, 4, 8, 3],
         embed_dim=[64, 128, 320, 512], head_dim=64, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-        
+
     # model.default_cfg = _cfg()
     return model
 
@@ -399,7 +390,7 @@ def uniformer_base(pretrained=True, **kwargs):
 #         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 #     model.default_cfg = _cfg()
 #     return model
-    
+
 
 
 class UniSegDecoder(nn.Module):
@@ -447,8 +438,8 @@ class UniSegDecoder(nn.Module):
         )
 
         self.proj1 = PatchEmbed(
-                img_size=img_size, patch_size=3, in_chans=in_chans, embed_dim=64, stride=1, padding=1)    
-        
+                img_size=img_size, patch_size=3, in_chans=in_chans, embed_dim=64, stride=1, padding=1)
+
         if not self.segmentation:
             self.up = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
         if cls_chans==0:
@@ -456,13 +447,13 @@ class UniSegDecoder(nn.Module):
         else:
             self.out = UnetOutBlock(spatial_dims=3, in_channels=64, out_channels=cls_chans)
         self.apply(self._init_weights)
-    
+
     def _init_weights(self, m):
         if isinstance(m, nn.Conv3d):
             nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
-    
+
     def forward(self, x0, x1, x2, x3, x4):
         # 3 skip-connection
         dec5 = self.decoder5(x4.permute(0,1,3,4,2), x3.permute(0,1,3,4,2))
@@ -471,7 +462,7 @@ class UniSegDecoder(nn.Module):
         dec3 = self.decoder3(dec4, x1.permute(0,1,3,4,2)) # convert to C,H,W,D
         if self.segmentation:
             x_proj = self.proj1(x0)
-            
+
             dec2 = self.decoder2(dec3, x_proj.permute(0,1,3,4,2))
             x_out = self.out(dec2)
             return dec5, dec4, dec3, dec2, x_out
@@ -488,7 +479,7 @@ class UniUiformer(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.init_channels = init_channels
-        
+
         self.ds = deep_supervised
 
         self.ds_out = []
@@ -498,32 +489,32 @@ class UniUiformer(nn.Module):
 
         self.encoder = uniformer_small(img_size=self.input_shape, in_chans=self.in_channels)
         self.decoder = UniSegDecoder(img_size=self.input_shape, in_chans=self.in_channels, cls_chans=self.out_channels, segmentation=segmentation)
-        
+
         if self.ds:
             self.ds_out.append(nn.Conv3d(init_channels*2, self.out_channels, (1, 1, 1)))
-            
+
             self.up_out.append(nn.Upsample(scale_factor=4, mode='trilinear', align_corners=True))
-            
+
             self.ds_out.append(nn.Conv3d(init_channels*1, self.out_channels, (1, 1, 1)))
             # self.ds_out.append(nn.Conv3d(init_channels*2, self.out_channels, (1, 1, 1)))
             self.up_out.append(nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True))
-            
+
             self.ds_out = nn.ModuleList(self.ds_out)
 
-        
+
     def forward(self, x):
         x0, x1, x2, x3, x4 = self.encoder(x)
         style = [x2, x3, x4]
         content = x4
-        
+
         u5, u4, u3, u2, uout = self.decoder(x0, x1, x2, x3, x4)
 
         if self.ds and self.training:
-        
+
             out4 = self.up_out[0](self.ds_out[0](u4))
             out3 = self.up_out[1](self.ds_out[1](u3))
             uout = [out4, out3, uout]
-        
+
         return uout, style, content
 
 
@@ -536,23 +527,23 @@ class Uniformer_b(nn.Module):
         # if self.training:
         #     return uout, style, content
         return uout
-    
+
 class cls_model(torch.nn.Module):
     def __init__(self,in_channels, out_channels, img_size,  init_channels=16, pretrain_path='',deep_supervised=False):
         super().__init__()
         #==============Model====================
         self.model  = Uniformer_b(input_shape=img_size,
-                    in_channels=in_channels, 
+                    in_channels=in_channels,
                     out_channels=out_channels,
                     init_channels=init_channels,
-                    deep_supervised = deep_supervised, 
+                    deep_supervised = deep_supervised,
                     segmentation=True)
         if pretrain_path:
             print("[!]using pretrain model")
             checkpoint = torch.load(pretrain_path, map_location="cpu")
             state_dict = checkpoint['state_dict']
 
-            torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(state_dict, "module.") 
+            torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(state_dict, "module.")
             del checkpoint
             new_dict ={}
             for k,v in state_dict.items():
@@ -561,18 +552,18 @@ class cls_model(torch.nn.Module):
                     new_dict[new_k] = v
             del state_dict
             # del new_dict['uniformer.encoder.patch_embed1.proj.weight']
-            
+
             # check missing keys and unexpected keys
             missing_keys, unexpected_keys = self.model.load_state_dict(new_dict, strict=False)
             print(f"Missing keys: {missing_keys}")
             print(f"Unexpected keys: {unexpected_keys}")
-            
+
             # Load pretrain model here
         #=======================================
         self.head = torch.nn.Linear(512,out_channels)
-        
+
     def forward(self,x):
-        _,_,_,_,x4 = self.model.uniformer.encoder(x) # 
+        _,_,_,_,x4 = self.model.uniformer.encoder(x) #
         out = self.head(x4.flatten(2).mean(-1))
         return out
 

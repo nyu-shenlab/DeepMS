@@ -144,7 +144,7 @@ class SingleModalityDataset(Dataset):
             f"in directory: {sample_dir}"
         )
 
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
         """
         Load one sample and apply optional transforms.
 
@@ -164,9 +164,15 @@ class SingleModalityDataset(Dataset):
 
         # Apply transform if provided
         if self.transform is not None:
-            sample = self.transform(sample)
+            transformed = self.transform(sample)
+            if transformed is None:
+                raise RuntimeError(
+                    "Image transform failed for "
+                    f"m_id={sample.get('m_id')}, image={sample.get('image')}."
+                )
+            sample = transformed
 
-        # Standardize label type
+        # Standardize label and identifier types.
         label = sample["label"]
         if not torch.is_tensor(label):
             label = torch.tensor(label, dtype=torch.float32)
@@ -181,7 +187,7 @@ class SingleModalityDataset(Dataset):
             "lesion_mask": sample.get("lesion_mask"),
             "modality": sample["modality"],
             "modality_label": sample.get("modality_label"),
-            "m_id": sample["m_id"],
+            "m_id": str(sample["m_id"]),
             "label": label,
         }
 
@@ -204,11 +210,10 @@ def collate_skip_none(batch: List[Optional[Dict[str, Any]]]) -> Optional[Dict[st
     batch = [item for item in batch if item is not None]
 
     if len(batch) == 0:
-        return None
+        raise RuntimeError("All samples in the batch were invalid.")
 
     try:
         return default_collate(batch)
     except Exception as exc:
         print(f"[collate_skip_none] Error during collation: {exc}", flush=True)
-        print(f"[collate_skip_none] Batch content: {batch}", flush=True)
-        return None
+        raise RuntimeError("Failed to collate a dataset batch.") from exc

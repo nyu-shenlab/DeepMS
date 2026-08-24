@@ -42,7 +42,7 @@ We are actively preparing the codebase and release materials for public dissemin
 - [x] Preprocessing pipeline
 - [x] Model architecture and training framework
 - [x] Validation and inference workflow
-- [ ] Environment setup and bash scripts (coming soon)
+- [x] Reproducible uv environment and Slurm training/inference jobs
 
 ---
 
@@ -130,9 +130,212 @@ Internal clinical datasets and trained model weights are not publicly available 
 
 ---
 
+## Repository Layout
+
+```text
+DeepMS/
+├── configs/accelerate/       # Reproducible multi-GPU training configuration
+├── docs/                     # Data and metadata contracts
+├── model/                    # Model architectures
+├── preprocessing/            # Structural and diffusion MRI preprocessing
+├── scripts/slurm/            # Training and internal/external inference jobs
+├── tests/                    # Unit tests and a two-process validation smoke test
+├── utils/                    # Dataset, schedule, and aggregation utilities
+├── infer.py                  # Single-GPU inference entry point
+├── train.py                  # Training entry point
+├── pyproject.toml            # Direct and optional dependencies
+└── uv.lock                   # Fully resolved Linux x86_64 environment
+```
+
 ## Getting Started
 
-Step-by-step documentation for environment setup, data preparation, training, and evaluation will be coming soon!
+### Requirements
+
+- Linux x86_64
+- an NVIDIA driver compatible with the locked PyTorch 2.6.0 / CUDA 12.4 build
+- [uv](https://docs.astral.sh/uv/)
+- Slurm for the provided cluster jobs
+
+Clone the repository and create the core training/inference environment:
+
+```bash
+git clone https://github.com/nyu-shenlab/DeepMS.git
+cd DeepMS
+uv sync --locked --no-dev
+```
+
+The project pins Python 3.11 and the direct package versions used in the
+original `preprocessing` Conda environment. The lockfile also fixes all
+transitive dependencies.
+
+Install the optional preprocessing tools, including ANTsPy and HD-BET 2.0.1:
+
+```bash
+uv sync --locked --no-dev --extra preprocessing
+```
+
+HD-BET downloads its model parameters on first use. To enable Weights & Biases
+logging, add the tracking extra:
+
+```bash
+uv sync --locked --no-dev --extra tracking
+```
+
+Verify the environment without starting a job:
+
+```bash
+uv run --locked --no-dev python -c \
+  "import torch, monai; print(torch.__version__, torch.version.cuda, monai.__version__)"
+uv run --locked --no-dev python train.py --help
+uv run --locked --no-dev python infer.py --help
+```
+
+### Data preparation
+
+The image-level and patient-level CSV schemas are documented in
+[docs/DATA_FORMAT.md](docs/DATA_FORMAT.md). Use de-identified identifiers and
+keep all clinical metadata and images outside the Git repository.
+
+Structural MRI preprocessing:
+
+```bash
+uv run --locked --no-dev --extra preprocessing python \
+  preprocessing/Structural_MRI_Preprocessing.py \
+  --csv /path/to/structural_metadata.csv \
+  --template /path/to/mni_template.nii \
+  --tpl_mask /path/to/mni_template_mask.nii \
+  --out_dir /path/to/structural_outputs \
+  --skip_exist
+```
+
+Diffusion-map normalization:
+
+```bash
+uv run --locked --no-dev python preprocessing/dmri_preprocessing.py \
+  --dataset_path /path/to/dmri_metadata.csv \
+  --output_base_path /path/to/dmri_outputs \
+  --output_csv_path /path/to/dmri_metadata_processed.csv
+```
+
+Run either command with `--help` before processing a new dataset. The
+structural workflow is GPU-gated because its default pipeline includes HD-BET.
+
+### Training with Slurm
+
+The released job mirrors the full multimodal, two-GPU training configuration
+used by the development repository. Set the five required inputs and submit
+from the repository root:
+
+```bash
+export DEEPMS_TRAIN_CSV=/path/to/train_images.csv
+export DEEPMS_VAL_CSV=/path/to/validation_images.csv
+export DEEPMS_DIAGNOSIS_CSV=/path/to/train_diagnoses.csv
+export DEEPMS_WM_LESION_CSV=/path/to/white_matter_lesions.csv
+export DEEPMS_PRETRAINED_PATH=/path/to/VoComni_B.pt
+
+sbatch scripts/slurm/train.sbatch
+```
+
+Optional controls include `DEEPMS_OUTPUT_ROOT`,
+`DEEPMS_RESUME_CHECKPOINT`, `DEEPMS_NUM_EPOCHS`,
+`DEEPMS_BATCH_SIZE`, `DEEPMS_VAL_BATCH_SIZE`, `DEEPMS_LEARNING_RATE`,
+`DEEPMS_MIN_LR`, `DEEPMS_GRADIENT_ACCUMULATION_STEPS`,
+`DEEPMS_AUC_METRIC`, `DEEPMS_SEED`, and `DEEPMS_FOLD`. Warmup is disabled
+by default. Set an exact `DEEPMS_WARMUP_STEPS`, or set
+`DEEPMS_USE_WARMUP=1` with `DEEPMS_WARMUP_EPOCHS`.
+
+The training batch size is global across GPUs and accumulation steps. The
+cosine horizon is computed from the prepared per-rank training loader:
+
+```text
+updates per epoch = ceil(prepared loader batches / gradient accumulation)
+total updates = updates per epoch * configured epochs
+```
+
+The scheduler advances after each successful optimizer update—not once per
+epoch or once per raw batch—and resumes from the saved update count. Validation
+uses both training ranks: predictions are gathered globally, checked for
+one-to-one row coverage, and early stopping is synchronized across ranks. See
+[docs/DISTRIBUTED_EXECUTION.md](docs/DISTRIBUTED_EXECUTION.md) for the exact
+batch, schedule, validation, and aggregation contracts.
+
+The script uses `uv run --locked --no-sync`: create the environment on the
+login node before submitting so compute jobs never mutate the environment or
+contact package indexes.
+
+### Internal inference with Slurm
+
+```bash
+export DEEPMS_MODEL_PATH=/path/to/best_model.pth
+export DEEPMS_INTERNAL_TEST_CSV=/path/to/internal_test_images.csv
+
+sbatch scripts/slurm/infer_internal.sbatch
+```
+
+The internal job evaluates the complete structural, DTI, SMI, and WDKI
+modality set. It requests one GPU and runs inference in one Python process. Set
+`DEEPMS_USE_CIS=1` only when label `2` should explicitly be mapped to the
+positive class; otherwise non-binary rows are excluded and counted.
+
+### External inference with Slurm
+
+```bash
+export DEEPMS_MODEL_PATH=/path/to/best_model.pth
+export DEEPMS_EXTERNAL_TEST_CSV=/path/to/external_test_images.csv
+
+sbatch scripts/slurm/infer_external.sbatch
+```
+
+The external job uses the structural-only deployment modalities from the
+released experiment. Lesion-masked inputs and NIfTI visualizations are enabled
+by default to match the reference job. Set
+`DEEPMS_USE_MASKED_IMAGES=0` and/or `DEEPMS_SAVE_VISUALIZATIONS=0` to
+disable them.
+
+Both inference jobs request one GPU. `DEEPMS_BATCH_SIZE` is the ordinary
+inference-loader batch size and `DEEPMS_NUM_WORKERS` is the loader worker
+count.
+
+All three jobs accept `DEEPMS_PROJECT_ROOT` when submitted outside the
+repository root and `DEEPMS_MIXED_PRECISION` (`no`, `fp16`, or `bf16`). Only
+the multi-GPU training job uses `DEEPMS_MASTER_PORT`.
+
+### Tests and preflight checks
+
+Install the development group, then run the full deterministic suite:
+
+```bash
+uv sync --locked
+uv run --locked python -m pytest -q
+uv run --locked ruff check .
+bash -n scripts/slurm/*.sbatch
+sbatch --test-only scripts/slurm/train.sbatch
+sbatch --test-only scripts/slurm/infer_internal.sbatch
+sbatch --test-only scripts/slurm/infer_external.sbatch
+```
+
+The tests include a real two-process CPU launch that calls the production
+`train.validate_model` function and verifies exact global row coverage. Slurm
+`--test-only` validates scheduler acceptance without submitting a job; it is
+not a substitute for a representative GPU smoke run.
+
+### Outputs
+
+Training creates a timestamped experiment directory under `outputs/train/`
+by default, including TensorBoard logs, update-aware resume checkpoints,
+`best_model.pth`, and `final_model.pth`.
+
+Inference writes per-modality and combined scan-level predictions plus four
+explicit patient-level tables: patient-modality, flat-logit, structural-MRI,
+and the training-aligned two-stage multimodal ensemble. `metrics.json` records
+metrics at each level, while `coverage.json` records requested, excluded,
+missing-modality, predicted-row, and predicted-patient counts. Optional NIfTI
+visualizations are written under `visualizations/` using row-specific paths.
+
+Model weights and clinical data are not distributed in this repository. The
+VoCo initialization is available from the
+[Large-Scale Medical repository](https://github.com/Luffy03/Large-Scale-Medical);
+users are responsible for confirming the upstream checkpoint and its terms.
 
 ---
 
@@ -142,6 +345,7 @@ We thank the authors of the following repositories for their open-source contrib
 
 - **dMRI Preprocessing & Quantitative Maps:** [NYU-DiffusionMRI/DESIGNER-v2](https://github.com/NYU-DiffusionMRI/DESIGNER-v2)
 - **Pre-trained Models:** [Luffy03/Large-Scale-Medical](https://github.com/Luffy03/Large-Scale-Medical)
+- **Brain Extraction:** [MIC-DKFZ/HD-BET](https://github.com/MIC-DKFZ/HD-BET)
 
 ---
 
@@ -160,3 +364,10 @@ If you find this work helpful for your research, please cite our manuscript:
   journal = {medRxiv},
   url = {https://www.medrxiv.org/content/10.64898/2026.03.04.26347460v1}
 }
+```
+
+---
+
+## License
+
+DeepMS is released under the [MIT License](LICENSE).

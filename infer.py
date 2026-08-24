@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -13,16 +14,21 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
+from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate.utils import broadcast_object_list, gather_object
 from monai.data import DataLoader
-from sklearn.metrics import roc_auc_score
 
 sys.path.append(os.getcwd())
 
 from model.Models import VisualEncoder
-from utils.analysis import avg_logits_ensemble, grouped_avg_prob_ensemble_smri
 from utils.dataset import SingleModalityDataset, collate_skip_none
+from utils.evaluation import (
+    binary_metrics,
+    build_inference_outputs,
+    json_safe,
+    validate_prediction_coverage,
+)
 from utils.transforms import FilterImages
-
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -45,11 +51,11 @@ WDKI_LIST = ["ak_wdki", "rk_wdki", "mk_wdki"]
 # -----------------------------------------------------------------------------
 # Utilities
 # -----------------------------------------------------------------------------
-def setup_logging() -> None:
-    """Configure root logger."""
+def setup_logging(is_main_process: bool = True) -> None:
+    """Configure concise logging while keeping worker ranks quiet."""
     logging.basicConfig(
         stream=sys.stdout,
-        level=logging.INFO,
+        level=logging.INFO if is_main_process else logging.ERROR,
         format="[%(asctime)s] %(levelname)s - %(message)s",
     )
 
@@ -62,10 +68,8 @@ def parse_args() -> argparse.Namespace:
 
     # Data / metadata
     parser.add_argument(
-        "--base_root",
-        type=str,
-        default="/gpfs/data/shenlab/Jiajian/MS_Project/ms_data/MESO_V2.0/ALLSUBJS_2.0",
-        help="Root directory of the dataset.",
+        "--base_root", type=str, default=None,
+        help="Deprecated compatibility option; image paths are read from the metadata CSV.",
     )
     parser.add_argument(
         "--test_patient_ids",
@@ -118,6 +122,12 @@ def parse_args() -> argparse.Namespace:
         help="How to interpret model score output.",
     )
     parser.add_argument("--use_cis", action="store_true", help="Map CIS label 2 -> positive class 1.")
+    parser.add_argument(
+        "--mixed_precision",
+        default="fp16",
+        choices=["no", "fp16", "bf16"],
+        help="Inference autocast precision used by Accelerate.",
+    )
 
     # Outputs
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save CSV outputs.")
@@ -165,6 +175,27 @@ def normalize_model_paths(model_paths: Sequence[str], modalities: Sequence[str])
     return list(model_paths)
 
 
+def positive_class_logit(score: torch.Tensor, loss_type: str) -> torch.Tensor:
+    """Return one scalar log-odds value per sample for binary ensembling."""
+    if score.dim() == 1:
+        scalar_score = score
+    elif score.dim() == 2 and score.shape[1] == 1:
+        scalar_score = score[:, 0]
+    elif score.dim() == 2 and score.shape[1] == 2:
+        return score[:, 1] - score[:, 0]
+    else:
+        raise ValueError(
+            f"Expected score shape [B], [B, 1], or [B, 2], got {tuple(score.shape)}."
+        )
+
+    if loss_type == "bce_with_logits":
+        return scalar_score
+    if loss_type == "bce":
+        eps = torch.finfo(scalar_score.dtype).eps
+        return torch.logit(scalar_score.clamp(min=eps, max=1.0 - eps))
+    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+
 def infer_probability(score: torch.Tensor, loss_type: str) -> torch.Tensor:
     """
     Convert model score to positive-class probability.
@@ -188,17 +219,6 @@ def infer_probability(score: torch.Tensor, loss_type: str) -> torch.Tensor:
     raise ValueError(f"Unsupported loss_type: {loss_type}")
 
 
-def safe_auc(y_true: Sequence[int], y_prob: Sequence[float]) -> float:
-    """Compute ROC AUC safely; return NaN if invalid."""
-    try:
-        if len(set(y_true)) < 2:
-            return float("nan")
-        return roc_auc_score(y_true, y_prob)
-    except Exception as exc:
-        logging.warning(f"Failed to compute AUC: {exc}")
-        return float("nan")
-
-
 def ensure_dir(path: str) -> None:
     """Create directory if it does not exist."""
     os.makedirs(path, exist_ok=True)
@@ -208,84 +228,119 @@ def ensure_dir(path: str) -> None:
 # Data preparation
 # -----------------------------------------------------------------------------
 def prepare_test_dataframe(args: argparse.Namespace) -> pd.DataFrame:
-    """
-    Prepare test dataframe and align fields with dataset / training expectations.
-    """
+    """Validate, filter, and assign stable row IDs to an inference manifest."""
     if not os.path.exists(args.test_patient_ids):
         raise FileNotFoundError(f"Test CSV not found: {args.test_patient_ids}")
 
-    df = pd.read_csv(args.test_patient_ids)
-    df = df[df["modality"].isin(args.modalities)].copy()
+    raw = pd.read_csv(args.test_patient_ids, dtype={"m_id": "string"})
+    required_base = {"m_id", "modality"}
+    missing_base = sorted(required_base - set(raw.columns))
+    if missing_base:
+        raise ValueError(f"Test CSV is missing columns: {missing_base}")
+    if raw["m_id"].isna().any():
+        raise ValueError("Test CSV contains missing m_id values.")
+    raw["m_id"] = raw["m_id"].str.strip()
+    if raw["m_id"].eq("").any():
+        raise ValueError("Test CSV contains empty m_id values.")
+    raw["source_row"] = np.arange(len(raw), dtype=np.int64)
 
+    df = raw[raw["modality"].isin(args.modalities)].copy()
     if df.empty:
         raise ValueError("No rows left after filtering requested modalities.")
 
-    # Labels
     if "ms" not in df.columns and "label" in df.columns:
         df["ms"] = df["label"]
     if "label" not in df.columns and "ms" in df.columns:
         df["label"] = df["ms"]
-
     if "ms" not in df.columns or "label" not in df.columns:
         raise ValueError("Test CSV must contain either 'ms' or 'label'.")
 
+    df["label"] = pd.to_numeric(df["label"], errors="coerce")
+    df["ms"] = pd.to_numeric(df["ms"], errors="coerce")
+    label_counts_before = df["label"].value_counts(dropna=False).to_dict()
     if args.use_cis:
         df.loc[df["ms"] == 2, "ms"] = 1
         df.loc[df["label"] == 2, "label"] = 1
 
-    df = df[df["label"].isin([0, 1])].copy()
+    conflicting_columns = (
+        df["label"].notna() & df["ms"].notna() & df["label"].ne(df["ms"])
+    )
+    if conflicting_columns.any():
+        raise ValueError(
+            f"Test CSV contains {int(conflicting_columns.sum())} rows where label and ms disagree."
+        )
 
-    # Metadata
+    requested_rows_before_label_filter = len(df)
+    df = df[df["label"].isin([0, 1])].copy()
+    df["label"] = df["label"].astype(int)
+    df["ms"] = df["ms"].astype(int)
+
+    path_flags = [args.use_preprocess, args.use_bet_only, args.use_mask_img]
+    if sum(bool(flag) for flag in path_flags) > 1:
+        raise ValueError(
+            "Choose only one of --use_preprocess, --use_bet_only, and --use_mask_img."
+        )
+
     df["structural_mri"] = df["modality"].isin(STRUCTURAL_MRI_LIST).astype(int)
     df["SMI"] = df["modality"].isin(SMI_LIST).astype(int)
-
-    modality_to_idx = {m: i for i, m in enumerate(args.modalities)}
+    modality_to_idx = {modality: index for index, modality in enumerate(args.modalities)}
     df["modality_label"] = df["modality"].map(modality_to_idx).astype(int)
 
-    # Optional columns
     if "Sex" not in df.columns:
         df["Sex"] = 0
     if "Age" not in df.columns:
         df["Age"] = 0
-
-    df["Sex"] = df["Sex"].fillna(0)
+    df["Sex"] = df["Sex"].fillna(0).replace({"F": 1, "M": 0}).astype(int)
     df["Age"] = df["Age"].fillna(0)
-    df["Sex"] = df["Sex"].replace({"F": 1, "M": 2}).astype(int)
 
-    # Lesion-mask availability
     df["mask_path"] = 0
     if "masked_image_path" in df.columns:
         df.loc[df["masked_image_path"].notna(), "mask_path"] = 1
         if "preprocessing" in df.columns:
             df.loc[df["masked_image_path"].isna(), "masked_image_path"] = df["preprocessing"]
+    elif "preprocessing" in df.columns:
+        df["masked_image_path"] = df["preprocessing"]
     else:
-        if "preprocessing" in df.columns:
-            df["masked_image_path"] = df["preprocessing"]
-        else:
-            df["masked_image_path"] = None
+        df["masked_image_path"] = None
 
-    # Image path selection
     if args.use_preprocess:
         required_col = "preprocessing"
-        df["image"] = df["preprocessing"]
     elif args.use_bet_only:
         required_col = "bet"
-        df["image"] = df["bet"]
     elif args.use_mask_img:
         required_col = "masked_image_path"
-        df["image"] = df["masked_image_path"]
     else:
         required_col = "non-preprocessing"
-        df["image"] = df["non-preprocessing"]
-
     if required_col not in df.columns:
         raise ValueError(f"Required column '{required_col}' not found in test CSV.")
-
+    df["image"] = df[required_col]
+    rows_before_path_filter = len(df)
     df = df[df["image"].notna()].copy()
-
     if df.empty:
         raise ValueError("No valid test samples remain after image-path filtering.")
 
+    inconsistent = df.groupby("m_id")["label"].nunique(dropna=False) > 1
+    if inconsistent.any():
+        raise ValueError(
+            f"Found {int(inconsistent.sum())} patients with conflicting binary labels."
+        )
+
+    df = df.reset_index(drop=True)
+    df["row_id"] = np.arange(len(df), dtype=np.int64)
+    df.attrs["input_coverage"] = {
+        "input_rows": int(len(raw)),
+        "requested_modality_rows": int(requested_rows_before_label_filter),
+        "excluded_non_binary_label_rows": int(requested_rows_before_label_filter - rows_before_path_filter),
+        "excluded_missing_image_rows": int(rows_before_path_filter - len(df)),
+        "selected_rows": int(len(df)),
+        "selected_patients": int(df["m_id"].nunique()),
+        "label_counts_before_mapping": {str(key): int(value) for key, value in label_counts_before.items()},
+        "requested_modalities": list(args.modalities),
+        "available_modalities": sorted(df["modality"].unique().tolist()),
+        "missing_modalities": sorted(set(args.modalities) - set(df["modality"])),
+        "cis_mapped_to_positive": bool(args.use_cis),
+        "image_column": required_col,
+    }
     return df
 
 
@@ -306,6 +361,7 @@ def build_test_loader(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        persistent_workers=args.num_workers > 0,
         shuffle=False,
         drop_last=False,
         collate_fn=collate_skip_none,
@@ -369,6 +425,7 @@ def save_visualization_batch(
     lesion_mask: torch.Tensor,
     mask_path: torch.Tensor,
     m_ids: Sequence,
+    row_ids: Sequence[int],
     modality: str,
     visualization_dir: str,
 ) -> None:
@@ -377,7 +434,7 @@ def save_visualization_batch(
 
     Saved files per case
     --------------------
-    - {modality}.nii.gz
+    - row_{row_id}/{modality}.nii.gz
     - {modality}_prob_map_{i}.nii.gz
     - {modality}_attention_map_{i}.nii.gz
     - lesion_mask.nii.gz (if available)
@@ -387,11 +444,13 @@ def save_visualization_batch(
     if isinstance(m_ids, torch.Tensor):
         m_ids = [item.item() if hasattr(item, "item") else item for item in m_ids]
     m_ids = [str(x) for x in m_ids]
+    row_ids = [int(x) for x in row_ids]
 
-    if len(m_ids) != batch_size:
+    if len(m_ids) != batch_size or len(row_ids) != batch_size:
         logging.error(
-            f"Visualization skipped due to mismatched batch size: "
-            f"{batch_size} images vs {len(m_ids)} IDs."
+            "Visualization skipped due to mismatched batch size: "
+            f"{batch_size} images, {len(m_ids)} patient IDs, "
+            f"and {len(row_ids)} row IDs."
         )
         return
 
@@ -401,7 +460,7 @@ def save_visualization_batch(
 
     for i in range(batch_size):
         case_id = m_ids[i]
-        case_dir = os.path.join(visualization_dir, case_id)
+        case_dir = os.path.join(visualization_dir, case_id, f"row_{row_ids[i]}")
         ensure_dir(case_dir)
 
         image_tensor = val_images[i]
@@ -436,7 +495,7 @@ def save_visualization_batch(
             if int(mask_path[i]) == 1:
                 nib.save(
                     nib.Nifti1Image(current_lesion[0], affine),
-                    os.path.join(case_dir, "lesion_mask.nii.gz"),
+                    os.path.join(case_dir, f"{modality}_lesion_mask.nii.gz"),
                 )
 
         except Exception as exc:
@@ -453,57 +512,64 @@ def run_inference_for_modality(
     dataloader: DataLoader,
     modality: str,
     args: argparse.Namespace,
-    device: torch.device,
+    accelerator: Accelerator,
+    expected_row_ids: Sequence[int],
     visualization_dir: Optional[str] = None,
-) -> pd.DataFrame:
-    """
-    Run inference for one modality and return a result dataframe.
+) -> Optional[pd.DataFrame]:
+    """Infer one sharded modality and gather Python records exactly once."""
+    local_rows: List[Dict] = []
 
-    Output columns
-    --------------
-    - ms_prob
-    - accurate
-    - weighted_prob_sum
-    - sa_map_sum
-    - ms_logits
-    - pos_map_sum
-    - neg_map_sum
-    - max_ratio
-    """
-    all_rows: List[Dict] = []
-
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in dataloader:
             if batch is None:
-                continue
+                raise RuntimeError(f"Inference produced an empty batch for {modality}.")
 
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
+            images = batch["image"].to(accelerator.device, non_blocking=True)
+            labels = batch["label"].to(accelerator.device).reshape(-1)
+            row_ids = batch["row_id"].to(accelerator.device).long().reshape(-1)
 
-            outputs = model(images, train=False)
+            with accelerator.autocast():
+                outputs = model(images, train=False)
+                score = outputs["score"]
+                ms_prob = infer_probability(score, args.loss_type).reshape(-1)
+                ms_logits = positive_class_logit(score, args.loss_type).reshape(-1)
 
-            score = outputs["score"]
-            prob_map = outputs["prob"]
-            sa_map = outputs["SA_map"]
+            pred_labels = (ms_prob >= 0.5).long()
+            prob_map = outputs.get("prob")
+            sa_map = outputs.get("SA_map")
 
-            if score.dim() == 2 and score.shape[1] == 1:
-                score = score.squeeze(1)
+            metric_shape = ms_prob.shape
+            weighted_prob_sum = torch.full(metric_shape, torch.nan, device=ms_prob.device)
+            pos_map_sum = torch.full(metric_shape, torch.nan, device=ms_prob.device)
+            neg_map_sum = torch.full(metric_shape, torch.nan, device=ms_prob.device)
+            max_ratio = torch.full(metric_shape, torch.nan, device=ms_prob.device)
+            sa_map_sum = torch.full(metric_shape, torch.nan, device=ms_prob.device)
+            if prob_map is not None:
+                probability_map_float = prob_map.float()
+                spatial_dims = tuple(range(1, probability_map_float.ndim))
+                weighted_prob_sum = probability_map_float.sum(dim=spatial_dims)
+                pos_map_sum = (
+                    probability_map_float * (probability_map_float > 0)
+                ).sum(dim=spatial_dims)
+                neg_map_sum = -(
+                    probability_map_float * (probability_map_float <= 0)
+                ).sum(dim=spatial_dims)
+                max_ratio = torch.maximum(pos_map_sum, neg_map_sum) / (
+                    pos_map_sum + neg_map_sum + 1e-8
+                )
+            if sa_map is not None:
+                attention_map_float = sa_map.float()
+                sa_map_sum = attention_map_float.sum(
+                    dim=tuple(range(1, attention_map_float.ndim))
+                )
 
-            ms_prob = infer_probability(score, args.loss_type)
-            pred_labels = (ms_prob > 0.5).int()
-
-            weighted_prob_sum = prob_map.sum(dim=(1, 2, 3, 4)).cpu()
-            pos_map_sum = (prob_map * (prob_map > 0)).sum(dim=(1, 2, 3, 4)).cpu()
-            neg_map_sum = -(prob_map * (prob_map <= 0)).sum(dim=(1, 2, 3, 4)).cpu()
-            max_ratio = torch.max(pos_map_sum, neg_map_sum) / (pos_map_sum + neg_map_sum + 1e-8)
-            sa_map_sum = sa_map.sum(dim=(1, 2, 3, 4)).cpu()
-
-            lesion_mask = batch.get("lesion_mask", None)
-            mask_path = batch.get("mask_path", None)
-
+            lesion_mask = batch.get("lesion_mask")
+            mask_path = batch.get("mask_path")
             if (
                 args.visualization
                 and visualization_dir is not None
+                and prob_map is not None
+                and sa_map is not None
                 and lesion_mask is not None
                 and mask_path is not None
             ):
@@ -514,44 +580,67 @@ def run_inference_for_modality(
                     lesion_mask=lesion_mask,
                     mask_path=mask_path,
                     m_ids=batch["m_id"],
+                    row_ids=row_ids.detach().cpu().tolist(),
                     modality=modality,
                     visualization_dir=visualization_dir,
                 )
 
-            batch_size = labels.shape[0]
-            for i in range(batch_size):
-                row = {
-                    "m_id": batch["m_id"][i],
-                    "modality": modality,
-                    "label": int(labels[i].item()),
-                    "ms": int(labels[i].item()),
-                    "ms_prob": float(ms_prob[i].cpu().item()),
-                    "accurate": bool(pred_labels[i].cpu().item() == labels[i].cpu().item()),
-                    "weighted_prob_sum": float(weighted_prob_sum[i].item()),
-                    "sa_map_sum": float(sa_map_sum[i].item()),
-                    "ms_logits": float(score[i].detach().cpu().item()) if score.dim() == 1 else score[i].detach().cpu().tolist(),
-                    "pos_map_sum": float(pos_map_sum[i].item()),
-                    "neg_map_sum": float(neg_map_sum[i].item()),
-                    "max_ratio": float(max_ratio[i].item()),
-                }
+            m_ids = [str(value) for value in batch["m_id"]]
+            source_rows = batch["source_row"]
+            if isinstance(source_rows, torch.Tensor):
+                source_rows = source_rows.detach().cpu().tolist()
 
-                if "structural_mri" in batch:
-                    row["structural_mri"] = int(batch["structural_mri"][i])
-                if "SMI" in batch:
-                    row["SMI"] = int(batch["SMI"][i])
+            tensors = {
+                "row_id": row_ids.detach().cpu().tolist(),
+                "label": labels.detach().cpu().tolist(),
+                "ms_prob": ms_prob.detach().float().cpu().tolist(),
+                "ms_logits": ms_logits.detach().float().cpu().tolist(),
+                "pred": pred_labels.detach().cpu().tolist(),
+                "weighted_prob_sum": weighted_prob_sum.detach().float().cpu().tolist(),
+                "sa_map_sum": sa_map_sum.detach().float().cpu().tolist(),
+                "pos_map_sum": pos_map_sum.detach().float().cpu().tolist(),
+                "neg_map_sum": neg_map_sum.detach().float().cpu().tolist(),
+                "max_ratio": max_ratio.detach().float().cpu().tolist(),
+            }
+            for index, row_id in enumerate(tensors["row_id"]):
+                label = int(tensors["label"][index])
+                local_rows.append(
+                    {
+                        "row_id": int(row_id),
+                        "source_row": int(source_rows[index]),
+                        "m_id": m_ids[index],
+                        "modality": modality,
+                        "label": label,
+                        "ms": label,
+                        "ms_prob": float(tensors["ms_prob"][index]),
+                        "ms_logits": float(tensors["ms_logits"][index]),
+                        "accurate": bool(int(tensors["pred"][index]) == label),
+                        "weighted_prob_sum": float(tensors["weighted_prob_sum"][index]),
+                        "sa_map_sum": float(tensors["sa_map_sum"][index]),
+                        "pos_map_sum": float(tensors["pos_map_sum"][index]),
+                        "neg_map_sum": float(tensors["neg_map_sum"][index]),
+                        "max_ratio": float(tensors["max_ratio"][index]),
+                        "structural_mri": int(batch["structural_mri"][index].item()),
+                        "SMI": int(batch["SMI"][index].item()),
+                    }
+                )
 
-                all_rows.append(row)
+    gathered_rows = gather_object(local_rows)
+    if not accelerator.is_main_process:
+        return None
 
-    result_df = pd.DataFrame(all_rows)
-
-    if result_df.empty:
-        logging.warning(f"No inference results for modality: {modality}")
-        return result_df
-
-    acc = result_df["accurate"].mean()
-    auc = safe_auc(result_df["label"].tolist(), result_df["ms_prob"].tolist())
-
-    logging.info(f"[{modality}] N={len(result_df)} | Accuracy={acc:.4f} | AUC={auc:.4f}")
+    result_df = validate_prediction_coverage(
+        pd.DataFrame(gathered_rows),
+        expected_row_ids=expected_row_ids,
+    )
+    metrics = binary_metrics(result_df["label"], result_df["ms_prob"])
+    logging.info(
+        "[%s] N=%d | Accuracy=%.4f | AUC=%s",
+        modality,
+        metrics["count"],
+        metrics["accuracy"],
+        f"{metrics['auc']:.4f}" if np.isfinite(metrics["auc"]) else "undefined",
+    )
     return result_df
 
 
@@ -578,158 +667,194 @@ def summarize_activation_statistics(result_df: pd.DataFrame, modality: str) -> N
 def run_test_inference(
     test_df: pd.DataFrame,
     args: argparse.Namespace,
-    device: torch.device,
+    accelerator: Accelerator,
     image_size: Tuple[int, int, int],
-) -> pd.DataFrame:
-    """
-    Run inference across all requested modalities.
-
-    Returns
-    -------
-    Combined dataframe of all modality-level predictions.
-    """
-    ensure_dir(args.output_dir)
+) -> Optional[pd.DataFrame]:
+    """Run modality loaders and return combined results on the main process."""
+    if accelerator.is_main_process:
+        ensure_dir(args.output_dir)
+    accelerator.wait_for_everyone()
 
     model_paths = normalize_model_paths(args.model_paths, args.modalities)
-
     visualization_dir = None
     if args.visualization:
-        visualization_dir = os.path.join(
-            args.visualization_dir,
-            datetime.now().strftime("%Y%m%d"),
-        )
-        ensure_dir(visualization_dir)
+        date_holder = [
+            datetime.now().strftime("%Y%m%d") if accelerator.is_main_process else None
+        ]
+        broadcast_object_list(date_holder)
+        visualization_dir = os.path.join(args.visualization_dir, date_holder[0])
+        if accelerator.is_main_process:
+            ensure_dir(visualization_dir)
+        accelerator.wait_for_everyone()
 
     loaded_model = None
     current_model_path = None
     all_results: List[pd.DataFrame] = []
 
     for modality, model_path in zip(args.modalities, model_paths):
-        logging.info("=" * 80)
-        logging.info(f"Processing modality: {modality}")
-
         modality_df = test_df[test_df["modality"] == modality].copy()
-
         if modality_df.empty:
-            logging.warning(f"No test rows found for modality: {modality}")
+            if accelerator.is_main_process:
+                logging.warning("No test rows found for modality: %s", modality)
             continue
 
-        logging.info(f"Test size: {len(modality_df)}")
-        logging.info(f"MS positive: {(modality_df['label'] == 1).sum()}")
-        logging.info(f"MS negative: {(modality_df['label'] == 0).sum()}")
+        if accelerator.is_main_process:
+            logging.info("=" * 80)
+            logging.info(
+                "Processing %s: rows=%d positive=%d negative=%d",
+                modality,
+                len(modality_df),
+                int((modality_df["label"] == 1).sum()),
+                int((modality_df["label"] == 0).sum()),
+            )
 
-        dataloader = build_test_loader(modality_df, args)
-
+        dataloader = accelerator.prepare(
+            build_test_loader(modality_df, args)
+        )
         if loaded_model is None or current_model_path != model_path:
-            loaded_model = build_model(args, model_path, image_size, device)
+            if loaded_model is not None:
+                del loaded_model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            with accelerator.main_process_first():
+                loaded_model = build_model(
+                    args, model_path, image_size, accelerator.device
+                )
             current_model_path = model_path
-        else:
-            logging.info(f"Reusing loaded checkpoint for modality: {modality}")
+        elif accelerator.is_main_process:
+            logging.info("Reusing loaded checkpoint for modality: %s", modality)
 
+        expected_row_ids = modality_df["row_id"].astype(int).tolist()
         result_df = run_inference_for_modality(
             model=loaded_model,
             dataloader=dataloader,
             modality=modality,
             args=args,
-            device=device,
+            accelerator=accelerator,
+            expected_row_ids=expected_row_ids,
             visualization_dir=visualization_dir,
         )
 
-        if result_df.empty:
-            continue
+        if accelerator.is_main_process:
+            if result_df is None or result_df.empty:
+                raise RuntimeError(f"No inference results for modality {modality}.")
+            summarize_activation_statistics(result_df, modality)
+            modality_csv = os.path.join(
+                args.output_dir, f"prediction_{modality}.csv"
+            )
+            result_df.to_csv(modality_csv, index=False)
+            logging.info("Saved: %s", modality_csv)
+            all_results.append(result_df)
+        accelerator.wait_for_everyone()
 
-        summarize_activation_statistics(result_df, modality)
-
-        modality_csv = os.path.join(args.output_dir, f"prediction_{modality}.csv")
-        result_df.to_csv(modality_csv, index=False)
-        logging.info(f"Saved: {modality_csv}")
-
-        all_results.append(result_df)
-
+    if not accelerator.is_main_process:
+        return None
     if not all_results:
         raise RuntimeError("No results were generated for any modality.")
 
-    all_results_df = pd.concat(all_results, ignore_index=True)
+    all_results_df = validate_prediction_coverage(
+        pd.concat(all_results, ignore_index=True),
+        expected_row_ids=test_df["row_id"].astype(int).tolist(),
+    )
     all_csv = os.path.join(args.output_dir, "prediction_all_modalities.csv")
     all_results_df.to_csv(all_csv, index=False)
-    logging.info(f"Saved combined results: {all_csv}")
-
+    logging.info("Saved combined results: %s", all_csv)
     return all_results_df
 
 
 # -----------------------------------------------------------------------------
 # Optional ensemble reporting
 # -----------------------------------------------------------------------------
-def run_group_ensembles(all_results_df: pd.DataFrame, modalities: Sequence[str]) -> None:
-    """
-    Run simple ensemble summaries following the original project logic.
-    """
-    print("\n" + "-" * 40)
-    print("Ensemble summary")
+def save_ensemble_outputs(
+    all_results_df: pd.DataFrame,
+    output_dir: str,
+) -> dict:
+    """Persist every patient-level aggregation table and strict JSON metrics."""
+    outputs, metrics = build_inference_outputs(all_results_df)
+    filenames = {
+        "patient_modality": "prediction_patient_modality.csv",
+        "patient_flat_logit": "prediction_patient_flat_logit.csv",
+        "patient_smri": "prediction_patient_smri.csv",
+        "patient_multimodal": "prediction_patient_multimodal.csv",
+    }
+    for output_name, filename in filenames.items():
+        path = os.path.join(output_dir, filename)
+        outputs[output_name].to_csv(path, index=False)
+        logging.info("Saved: %s", path)
 
-    if any(m in modalities for m in STRUCTURAL_MRI_LIST):
-        print("\nAll structural MRI")
-        df_structural = all_results_df[all_results_df["modality"].isin(STRUCTURAL_MRI_LIST)]
-        if not df_structural.empty:
-            avg_logits_ensemble(df_structural)
-
-    if any(m in modalities for m in DTI_LIST):
-        print("\nAll DTI")
-        df_dti = all_results_df[all_results_df["modality"].isin(DTI_LIST)]
-        if not df_dti.empty:
-            avg_logits_ensemble(df_dti)
-
-    if any(m in modalities for m in SMI_LIST):
-        print("\nAll SMI")
-        df_smi = all_results_df[all_results_df["modality"].isin(SMI_LIST)]
-        if not df_smi.empty:
-            avg_logits_ensemble(df_smi)
-
-    if any(m in modalities for m in WDKI_LIST):
-        print("\nAll WDKI")
-        df_wdki = all_results_df[all_results_df["modality"].isin(WDKI_LIST)]
-        if not df_wdki.empty:
-            avg_logits_ensemble(df_wdki)
-
-    if any(m in modalities for m in DKI_LIST):
-        print("\nAll DKI")
-        df_dki = all_results_df[all_results_df["modality"].isin(DKI_LIST)]
-        if not df_dki.empty:
-            avg_logits_ensemble(df_dki)
-
-    print("\nAll modalities")
-    avg_logits_ensemble(all_results_df)
-    grouped_avg_prob_ensemble_smri(all_results_df)
+    metrics_path = os.path.join(output_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as handle:
+        json.dump(json_safe(metrics), handle, indent=2, sort_keys=True, allow_nan=False)
+        handle.write("\n")
+    logging.info("Saved: %s", metrics_path)
+    return metrics
 
 
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main(args: argparse.Namespace) -> None:
-    setup_logging()
+    dataloader_config = DataLoaderConfiguration(
+        even_batches=False,
+        non_blocking=True,
+    )
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        dataloader_config=dataloader_config,
+    )
+    setup_logging(accelerator.is_main_process)
 
-    logging.info(f"Backbone: {args.backbone}")
-    logging.info(f"Modalities: {args.modalities}")
-    logging.info(f"Test CSV: {args.test_patient_ids}")
-    logging.info(f"Output dir: {args.output_dir}")
+    if accelerator.is_main_process:
+        logging.info("Backbone: %s", args.backbone)
+        logging.info("Modalities: %s", args.modalities)
+        logging.info("Test CSV: %s", args.test_patient_ids)
+        logging.info("Output dir: %s", args.output_dir)
+        logging.info(
+            "Inference runtime: processes=%d precision=%s device=%s",
+            accelerator.num_processes,
+            args.mixed_precision,
+            accelerator.device,
+        )
 
     image_size = get_image_size(args)
-    logging.info(f"Image size: {image_size}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Device: {device}")
-
     test_df = prepare_test_dataframe(args)
+    input_coverage = dict(test_df.attrs.get("input_coverage", {}))
     all_results_df = run_test_inference(
         test_df=test_df,
         args=args,
-        device=device,
+        accelerator=accelerator,
         image_size=image_size,
     )
 
-    run_group_ensembles(all_results_df, args.modalities)
+    if accelerator.is_main_process:
+        if all_results_df is None:
+            raise RuntimeError("Main process did not receive inference results.")
+        metrics = save_ensemble_outputs(all_results_df, args.output_dir)
+        input_coverage["predicted_rows"] = int(len(all_results_df))
+        input_coverage["predicted_patients"] = int(all_results_df["m_id"].nunique())
+        input_coverage["prediction_rows_by_modality"] = {
+            str(key): int(value)
+            for key, value in all_results_df["modality"].value_counts().sort_index().items()
+        }
+        coverage_path = os.path.join(args.output_dir, "coverage.json")
+        with open(coverage_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                json_safe(input_coverage),
+                handle,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            handle.write("\n")
+        logging.info("Saved: %s", coverage_path)
+        logging.info(
+            "Inference completed successfully: rows=%d multimodal_patients=%d",
+            len(all_results_df),
+            metrics["multimodal_two_level_patient"]["count"],
+        )
 
-    logging.info("Inference completed successfully.")
+    accelerator.wait_for_everyone()
+    accelerator.free_memory()
 
 
 if __name__ == "__main__":
