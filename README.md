@@ -296,13 +296,25 @@ training ablation; inference is structural-only. See
 ### One-command ablation pipeline
 
 The recommended workflow is one submission. On Shenlab, the committed site
-profile already contains the verified shared GPFS inputs. Other sites should
-copy `configs/slurm.env.example` instead and replace its placeholders:
+profile already contains the verified shared GPFS inputs. After creating the
+locked uv environment, submit the site launcher directly from the clone root:
 
 ```bash
-cp configs/slurm.shenlab.env .env
-# Other clusters: cp configs/slurm.env.example .env
+/gpfs/data/shenlab/Jiajian/software/miniconda3/bin/uv sync --locked --no-dev
+sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
+sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
+```
 
+The launcher sources `configs/slurm.shenlab.env`, derives
+`DEEPMS_PROJECT_ROOT` from the current clone, generates a timestamped evaluation
+ID, and starts the complete dependency graph. The GPFS inputs require Shenlab
+access; no credentials or clinical records are stored in the repository.
+
+Other sites should copy `configs/slurm.env.example`, replace its placeholders,
+and submit the portable orchestration job:
+
+```bash
+cp configs/slurm.env.example .env
 set -a
 source .env
 set +a
@@ -310,10 +322,6 @@ set +a
 sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 ```
-
-The Shenlab profile derives `DEEPMS_PROJECT_ROOT` from the current clone and
-generates a timestamped evaluation ID. Its data paths require Shenlab GPFS
-access; no credentials or clinical records are stored in the repository.
 
 The lightweight CPU orchestration job validates required environment variables,
 input paths, mode compatibility, and fresh output destinations before its first

@@ -7,6 +7,7 @@ import pytest
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 PIPELINE_SCRIPT = REPOSITORY_ROOT / "scripts" / "slurm" / "ablation" / "run_diffusion_ablation_pipeline.sbatch"
+SHENLAB_LAUNCHER = REPOSITORY_ROOT / "scripts/slurm/ablation/submit_shenlab_ablation.sbatch"
 
 
 def _fake_pipeline_environment(
@@ -160,6 +161,53 @@ def test_both_pipeline_reuses_unmasked_inference_and_schedules_two_summaries(
     assert "MASKED_INFER_JOB_ID=1003" in state
     assert "DATASET_SUMMARY_JOB_ID=1004" in state
     assert "MASKING_SUMMARY_JOB_ID=1005" in state
+
+
+def test_shenlab_launcher_loads_a_site_profile_and_submits_the_full_graph(
+    tmp_path: Path,
+) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(
+        tmp_path,
+        mode="both",
+    )
+    profile_keys = [
+        "DEEPMS_PROJECT_ROOT",
+        "DEEPMS_UV_BIN",
+        "DEEPMS_TRAIN_CSV",
+        "DEEPMS_VAL_CSV",
+        "DEEPMS_PRETRAINED_PATH",
+        "DEEPMS_INTERNAL_TEST_CSV",
+        "DEEPMS_KRAKOW_TEST_CSV",
+        "DEEPMS_PUBLIC_EXTERNAL_TEST_CSV",
+        "DEEPMS_PIPELINE_MODE",
+        "DEEPMS_ABLATION_INFER_PROFILE",
+        "DEEPMS_ABLATION_EVAL_ID",
+        "DEEPMS_ABLATION_CONCURRENCY",
+        "DEEPMS_PIPELINE_TRAIN_ROOT",
+        "DEEPMS_ABLATION_INFERENCE_ROOT",
+        "DEEPMS_PIPELINE_STATE_ROOT",
+    ]
+    site_profile = tmp_path / "site-profile.env"
+    site_profile.write_text(
+        "\n".join(f"export {key}={shlex.quote(environment.pop(key))}" for key in profile_keys) + "\n",
+        encoding="utf-8",
+    )
+    environment["DEEPMS_SITE_PROFILE"] = str(site_profile)
+
+    completed = subprocess.run(
+        ["bash", str(SHENLAB_LAUNCHER)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    commands = [shlex.split(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
+    assert len(commands) == 5
+    assert "Loaded Shenlab profile" in completed.stdout
+    assert "PIPELINE_STATUS=scheduled" in state_file.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("mode", ["unknown", "dataset_calibrated"])

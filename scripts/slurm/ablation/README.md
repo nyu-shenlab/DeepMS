@@ -10,11 +10,22 @@ directory and are called by these wrappers.
 ```bash
 git clone https://github.com/nyu-shenlab/DeepMS.git
 cd DeepMS
-uv sync --locked --no-dev
+/gpfs/data/shenlab/Jiajian/software/miniconda3/bin/uv sync --locked --no-dev
 
-cp configs/slurm.shenlab.env .env
-# Other clusters: copy configs/slurm.env.example and replace its placeholders.
+sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
+sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
+```
 
+The launcher automatically loads the committed Shenlab profile, uses the shared
+GPFS inputs, derives the project root from the current clone, generates a
+timestamped evaluation ID, and submits the complete dependency graph. It does
+not contain credentials or clinical records.
+
+On another cluster, load a site-local copy of the portable template instead:
+
+```bash
+cp configs/slurm.env.example .env
+# Replace every placeholder with an absolute path available on that cluster.
 set -a
 source .env
 set +a
@@ -22,10 +33,6 @@ set +a
 sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 ```
-
-The Shenlab profile uses the shared GPFS inputs, derives the project root from
-the current clone, and generates a timestamped evaluation ID. It does not
-contain credentials or clinical records.
 
 For `both`, the required site-local inputs are:
 
@@ -36,8 +43,8 @@ For `both`, the required site-local inputs are:
 - `DEEPMS_PRETRAINED_PATH`
 - `DEEPMS_PUBLIC_EXTERNAL_TEST_CSV`
 
-The Shenlab and example configurations set `b0` on by default through the training
-wrapper. Set `DEEPMS_INCLUDE_B0=0` only for a deliberately strict
+The Shenlab and example configurations set `b0` on by default through the
+training wrapper. Set `DEEPMS_INCLUDE_B0=0` only for a deliberately strict
 T1/FLAIR-only baseline. Keep `.env`, clinical manifests, checkpoints, and
 outputs outside Git.
 
@@ -45,6 +52,7 @@ outputs outside Git.
 
 | Script | Role | Resources |
 | --- | --- | --- |
+| `submit_shenlab_ablation.sbatch` | Direct Shenlab profile loading and complete workflow submission | CPU only |
 | `run_diffusion_ablation_pipeline.sbatch` | Preflight and dependency-graph submission | CPU only |
 | `train_diffusion_ablation.sbatch` | 12 map-specific training tasks | 2 GPUs per task |
 | `infer_diffusion_ablation.sbatch` | 12 map-specific, structural-only inference tasks per profile | 1 GPU per task |

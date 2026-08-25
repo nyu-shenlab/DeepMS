@@ -22,11 +22,12 @@ def test_ablation_jobs_are_grouped_in_a_dedicated_subfolder() -> None:
     assert public_jobs == {
         "infer_diffusion_ablation.sbatch",
         "run_diffusion_ablation_pipeline.sbatch",
+        "submit_shenlab_ablation.sbatch",
         "summarize_inference_runs.sbatch",
         "train_diffusion_ablation.sbatch",
     }
     assert not list(SLURM_DIR.glob("*ablation*.sbatch"))
-    assert "sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch" in (
+    assert "sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch" in (
         ABLATION_SLURM_DIR / "README.md"
     ).read_text(encoding="utf-8")
 
@@ -72,9 +73,23 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     assert "\nexport DEEPMS_REPORT_COHORT_OVERRIDES=" not in text
 
     readme = (ABLATION_SLURM_DIR / "README.md").read_text(encoding="utf-8")
-    assert "cp configs/slurm.shenlab.env .env" in readme
+    assert "sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch" in readme
+    assert "sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch" in readme
     assert "sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch" in readme
     assert "sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch" in readme
+
+
+def test_shenlab_direct_submit_job_loads_the_committed_profile() -> None:
+    text = read_slurm("ablation/submit_shenlab_ablation.sbatch")
+
+    assert "#SBATCH --partition=cpu_short" in text
+    assert "#SBATCH --gres" not in text
+    assert "#SBATCH --array" not in text
+    assert 'PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"' in text
+    assert "configs/slurm.shenlab.env" in text
+    assert 'source "${SITE_PROFILE}"' in text
+    assert "run_diffusion_ablation_pipeline.sbatch" in text
+    assert 'exec bash "${PIPELINE_JOB}"' in text
 
 
 def test_diffusion_ablation_order_and_single_map_contract() -> None:
@@ -240,6 +255,7 @@ def test_public_slurm_assets_do_not_embed_site_specific_paths() -> None:
         SLURM_DIR / "infer_public_external_unmasked.sbatch",
         ABLATION_SLURM_DIR / "infer_diffusion_ablation.sbatch",
         ABLATION_SLURM_DIR / "summarize_inference_runs.sbatch",
+        ABLATION_SLURM_DIR / "submit_shenlab_ablation.sbatch",
         SLURM_DIR / "infer_public_external_lesion_masked.sbatch",
         REPOSITORY_ROOT / "configs" / "slurm.env.example",
         ABLATION_SLURM_DIR / "run_diffusion_ablation_pipeline.sbatch",
