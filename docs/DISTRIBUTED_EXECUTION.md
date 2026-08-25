@@ -59,6 +59,12 @@ Early stopping is decided on rank zero and reduced to every rank before any
 process exits the epoch loop. This prevents one rank from stopping while other
 ranks continue into a collective operation.
 
+Patience is counted in completed validation checks, not raw training epochs.
+The Shenlab profile validates every epoch and stops after five consecutive
+checks without a strict metric improvement; a tie consumes patience, while a
+strict improvement resets the counter. If `DEEPMS_VAL_INTERVAL` is increased,
+the same five-check rule applies at the wider interval.
+
 Validation reports four checkpoint-selection choices:
 
 - `micro`: pooled scan-level AUC

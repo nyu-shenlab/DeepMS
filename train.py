@@ -28,6 +28,7 @@ from utils.scheduling import (
     UpdateWarmupCosineScheduler,
     compute_optimizer_update_counts,
 )
+from utils.training_control import update_early_stopping
 from utils.transforms import FilterImages
 
 # ---------------------------------------------------------------------
@@ -166,7 +167,12 @@ def get_args():
     # -----------------------------------------------------------------
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--early_stopping_epochs", type=int, default=5)
+    parser.add_argument(
+        "--early_stopping_epochs",
+        type=int,
+        default=5,
+        help="Stop after this many consecutive validation checks without strict improvement.",
+    )
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--val_batch_size", type=int, default=24)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -1256,10 +1262,18 @@ def main(args):
                 )
 
                 current_metric = float(val_results["best_metric"])
-                if current_metric > best_metric:
-                    non_improve_epochs = 0
-                    best_metric = current_metric
-                    best_metric_epoch = epoch
+                early_stopping = update_early_stopping(
+                    current_metric=current_metric,
+                    best_metric=best_metric,
+                    best_metric_epoch=best_metric_epoch,
+                    non_improve_validations=non_improve_epochs,
+                    epoch=epoch,
+                    patience=args.early_stopping_epochs,
+                )
+                best_metric = early_stopping.best_metric
+                best_metric_epoch = early_stopping.best_metric_epoch
+                non_improve_epochs = early_stopping.non_improve_validations
+                if early_stopping.improved:
                     torch.save(
                         accelerator.unwrap_model(model).state_dict(),
                         os.path.join(output_path, "best_model.pth"),
@@ -1269,9 +1283,6 @@ def main(args):
                         os.path.join(output_path, f"best_model_epoch_{epoch}.pth"),
                     )
                     logger.info("Saved new best model.")
-                else:
-                    non_improve_epochs += 1
-
                 logger.info(
                     "Epoch %d | current %s=%.4f, best=%.4f at epoch %d",
                     epoch,
@@ -1288,7 +1299,7 @@ def main(args):
                             "epoch": epoch,
                         }
                     )
-                should_stop = non_improve_epochs >= args.early_stopping_epochs
+                should_stop = early_stopping.should_stop
 
         if accelerator.is_main_process and epoch % args.save_interval == 0:
             save_checkpoint(

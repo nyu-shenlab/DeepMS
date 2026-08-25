@@ -37,6 +37,44 @@ def test_generic_training_job_does_not_require_legacy_clinical_csvs() -> None:
     assert "DEEPMS_WM_LESION_CSV" not in text
     assert "DEEPMS_MODALITIES" in text
     assert "DEEPMS_VAL_MODALITIES" in text
+    assert "DEEPMS_EARLY_STOPPING_EPOCHS" in text
+    assert "DEEPMS_VAL_INTERVAL" in text
+    assert "DEEPMS_SAVE_INTERVAL" in text
+    assert '--early_stopping_epochs "${EARLY_STOPPING_EPOCHS}"' in text
+    assert '--val_interval "${VAL_INTERVAL}"' in text
+    assert '--save_interval "${SAVE_INTERVAL}"' in text
+
+
+def test_shenlab_site_profile_is_copy_ready() -> None:
+    text = (REPOSITORY_ROOT / "configs" / "slurm.shenlab.env").read_text(encoding="utf-8")
+
+    assert 'export DEEPMS_PROJECT_ROOT="$(pwd -P)"' in text
+    assert (
+        'export DEEPMS_TRAIN_CSV="/gpfs/data/shenlab/Jiajian/MS_Project/code/'
+        "ms-diagnosis/meta_data/updated_label_dataset/"
+        'train_dataset_all_latest_1230_ADNI_updated.csv"'
+    ) in text
+    assert (
+        'export DEEPMS_VAL_CSV="/gpfs/data/shenlab/Jiajian/MS_Project/code/'
+        "ms-diagnosis/meta_data/updated_label_dataset/reg/"
+        'validation_dataset_all_latest_updated.csv"'
+    ) in text
+    assert (
+        'export DEEPMS_PUBLIC_EXTERNAL_TEST_CSV="/gpfs/data/shenlab/Jiajian/'
+        'MS_Project/ms_data/external_dataset/lesion_filling/0_filled_all_dil_3.csv"'
+    ) in text
+    assert "export DEEPMS_EARLY_STOPPING_EPOCHS=5" in text
+    assert "export DEEPMS_VAL_INTERVAL=1" in text
+    assert "export DEEPMS_SAVE_INTERVAL=5" in text
+    assert "export DEEPMS_PIPELINE_MODE=both" in text
+    assert "export DEEPMS_INCLUDE_B0=1" in text
+    assert "export DEEPMS_SAVE_VISUALIZATIONS=0" in text
+    assert "\nexport DEEPMS_REPORT_COHORT_OVERRIDES=" not in text
+
+    readme = (ABLATION_SLURM_DIR / "README.md").read_text(encoding="utf-8")
+    assert "cp configs/slurm.shenlab.env .env" in readme
+    assert "sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch" in readme
+    assert "sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch" in readme
 
 
 def test_diffusion_ablation_order_and_single_map_contract() -> None:

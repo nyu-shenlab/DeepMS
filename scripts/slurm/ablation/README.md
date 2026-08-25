@@ -12,20 +12,20 @@ git clone https://github.com/nyu-shenlab/DeepMS.git
 cd DeepMS
 uv sync --locked --no-dev
 
-cp configs/slurm.env.example .env
-# Replace the placeholders with absolute paths available on the cluster.
+cp configs/slurm.shenlab.env .env
+# Other clusters: copy configs/slurm.env.example and replace its placeholders.
 
 set -a
 source .env
 set +a
 
-# Use a new ID for every submission.
-export DEEPMS_ABLATION_EVAL_ID=public-external-ablation-v1
-export DEEPMS_PIPELINE_MODE=both
-
 sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 ```
+
+The Shenlab profile uses the shared GPFS inputs, derives the project root from
+the current clone, and generates a timestamped evaluation ID. It does not
+contain credentials or clinical records.
 
 For `both`, the required site-local inputs are:
 
@@ -36,7 +36,7 @@ For `both`, the required site-local inputs are:
 - `DEEPMS_PRETRAINED_PATH`
 - `DEEPMS_PUBLIC_EXTERNAL_TEST_CSV`
 
-The example configuration sets `b0` on by default through the training
+The Shenlab and example configurations set `b0` on by default through the training
 wrapper. Set `DEEPMS_INCLUDE_B0=0` only for a deliberately strict
 T1/FLAIR-only baseline. Keep `.env`, clinical manifests, checkpoints, and
 outputs outside Git.

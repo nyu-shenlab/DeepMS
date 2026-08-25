@@ -43,6 +43,9 @@ done
 
 OUTPUT_ROOT="${DEEPMS_OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/train}"
 NUM_EPOCHS="${DEEPMS_NUM_EPOCHS:-40}"
+EARLY_STOPPING_EPOCHS="${DEEPMS_EARLY_STOPPING_EPOCHS:-5}"
+VAL_INTERVAL="${DEEPMS_VAL_INTERVAL:-1}"
+SAVE_INTERVAL="${DEEPMS_SAVE_INTERVAL:-5}"
 BATCH_SIZE="${DEEPMS_BATCH_SIZE:-16}"
 VAL_BATCH_SIZE="${DEEPMS_VAL_BATCH_SIZE:-16}"
 NUM_WORKERS="${DEEPMS_NUM_WORKERS:-4}"
@@ -65,7 +68,12 @@ case "${AUC_METRIC}" in
     micro|macro|hierarchical|ensemble) ;;
     *) fail "DEEPMS_AUC_METRIC must be micro, macro, hierarchical, or ensemble." ;;
 esac
-[[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]] ||     fail "DEEPMS_GRADIENT_ACCUMULATION_STEPS must be a positive integer."
+[[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]] || \
+    fail "DEEPMS_GRADIENT_ACCUMULATION_STEPS must be a positive integer."
+for name in NUM_EPOCHS EARLY_STOPPING_EPOCHS VAL_INTERVAL SAVE_INTERVAL; do
+    [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || \
+        fail "${name} must be a positive integer."
+done
 
 mkdir -p "${OUTPUT_ROOT}"
 
@@ -133,6 +141,8 @@ UV_RUN=("${UV_BIN}" run --locked --no-sync)
 printf 'DeepMS root: %s\n' "${PROJECT_ROOT}"
 printf 'Slurm job: %s | master port: %s\n' "${SLURM_JOB_ID:-local}" "${MASTER_PORT}"
 printf 'Training modalities: %s\n' "${TRAIN_MODALITIES[*]}"
+printf 'Training control: epochs=%s | validation interval=%s | early-stop patience=%s | checkpoint interval=%s\n' \
+    "${NUM_EPOCHS}" "${VAL_INTERVAL}" "${EARLY_STOPPING_EPOCHS}" "${SAVE_INTERVAL}"
 printf 'Validation modalities: %s\n' "${VALIDATION_MODALITIES[*]}"
 case "${DEEPMS_PREFLIGHT_ONLY:-0}" in
     1)
@@ -163,6 +173,9 @@ srun "${UV_RUN[@]}" accelerate launch \
     --num_epochs "${NUM_EPOCHS}" \
     --batch_size "${BATCH_SIZE}" \
     --val_batch_size "${VAL_BATCH_SIZE}" \
+    --early_stopping_epochs "${EARLY_STOPPING_EPOCHS}" \
+    --val_interval "${VAL_INTERVAL}" \
+    --save_interval "${SAVE_INTERVAL}" \
     --num_workers "${NUM_WORKERS}" \
     --lr "${LEARNING_RATE}" \
     --roi_x 128 --roi_y 128 --roi_z 128 \

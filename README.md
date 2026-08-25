@@ -237,6 +237,7 @@ sbatch scripts/slurm/train.sbatch
 
 Optional controls include `DEEPMS_OUTPUT_ROOT`,
 `DEEPMS_RESUME_CHECKPOINT`, `DEEPMS_NUM_EPOCHS`,
+`DEEPMS_EARLY_STOPPING_EPOCHS`, `DEEPMS_VAL_INTERVAL`, `DEEPMS_SAVE_INTERVAL`,
 `DEEPMS_BATCH_SIZE`, `DEEPMS_VAL_BATCH_SIZE`, `DEEPMS_LEARNING_RATE`,
 `DEEPMS_MIN_LR`, `DEEPMS_GRADIENT_ACCUMULATION_STEPS`,
 `DEEPMS_AUC_METRIC`, `DEEPMS_SEED`, `DEEPMS_FOLD`, and space-separated
@@ -266,9 +267,9 @@ contact package indexes.
 ### Single-map diffusion ablation
 
 The training component uses the same three required variables as
-All ablation-specific launchers are grouped under
+`train.sbatch`. All ablation-specific launchers are grouped under
 [`scripts/slurm/ablation/`](scripts/slurm/ablation/README.md).
-`train.sbatch`. For a training-only manual launch, it submits 12 tasks with
+For a training-only manual launch, it submits 12 tasks with
 at most four running concurrently:
 
 ```bash
@@ -294,22 +295,25 @@ training ablation; inference is structural-only. See
 
 ### One-command ablation pipeline
 
-The recommended workflow is one submission. First create and edit the ignored
-site-local environment file; every evaluation ID must be unique:
+The recommended workflow is one submission. On Shenlab, the committed site
+profile already contains the verified shared GPFS inputs. Other sites should
+copy `configs/slurm.env.example` instead and replace its placeholders:
 
 ```bash
-cp configs/slurm.env.example .env
-# Replace all placeholders in .env.
+cp configs/slurm.shenlab.env .env
+# Other clusters: cp configs/slurm.env.example .env
 
 set -a
 source .env
 set +a
 
-export DEEPMS_ABLATION_EVAL_ID=public-external-ablation-v1
-export DEEPMS_PIPELINE_MODE=both
-
+sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 ```
+
+The Shenlab profile derives `DEEPMS_PROJECT_ROOT` from the current clone and
+generates a timestamped evaluation ID. Its data paths require Shenlab GPFS
+access; no credentials or clinical records are stored in the repository.
 
 The lightweight CPU orchestration job validates required environment variables,
 input paths, mode compatibility, and fresh output destinations before its first
