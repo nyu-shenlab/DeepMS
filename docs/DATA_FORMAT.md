@@ -1,10 +1,12 @@
 # Data and metadata contract
 
 DeepMS uses one row per image acquisition. Repeated acquisitions for the same
-patient and modality are allowed and are averaged within patient-modality before
-cross-modality inference aggregation. Image files are not discovered recursively:
-every image used by preprocessing, training, or inference must be listed explicitly
-in a CSV. Absolute image paths are recommended on clusters.
+patient and modality are allowed. The generic inference hierarchy first averages
+within exact patient-modality pairs; the notebook-compatible performance report
+instead averages original scan rows directly within the FLAIR, T1-CE, and T1-NCE
+groups to reproduce the published analysis. Image files are not discovered
+recursively: every image used by preprocessing, training, or inference must be
+listed explicitly in a CSV. Absolute image paths are recommended on clusters.
 
 Do not commit clinical metadata, patient identifiers, images, or derived
 patient-level outputs to this repository.
@@ -28,7 +30,7 @@ NiBabel. The CSV itself is not copied into an output directory.
 
 ## Training inputs
 
-The training Slurm job requires four CSV files.
+The active training Slurm job requires two image-level CSV manifests.
 
 ### Image-level training CSV
 
@@ -53,30 +55,21 @@ Required columns are `m_id`, `modality`, `ms`, `Age`, `Sex`, and
 `preprocessing`. The released training recipe validates on the
 `preprocessing` path even though training uses `bet`.
 
-### Patient-level diagnosis CSV
+### Legacy auxiliary CSV options
 
-Exactly one row per `m_id`, with these columns:
+Older development code accepted a patient-level diagnosis CSV through
+`--train_diagnosis_df` and a patient-level lesion CSV through
+`--white_matter_list`. They produced the `important_diagnosis` and
+`white_matter_lesion` metadata fields, respectively. Neither field is consumed
+by the active model, loss, sampler, or validation code.
 
-| Column | Values |
-| --- | --- |
-| `migraine` | 0 or 1 |
-| `cerebral_vessel` | 0 or 1 |
-| `NMOSD` | 0 or 1 |
-| `mog` | 0 or 1 |
-| `other_demylin` | 0 or 1 |
-| `unspecified_demyelinating` | 0 or 1 |
-
-The spellings above match the released training code and are therefore
-case-sensitive.
-
-### Patient-level white-matter-lesion CSV
-
-Exactly one row per `m_id`, with a binary `wm_lesion` column.
+The two command-line options remain accepted for compatibility but are ignored;
+the released Slurm jobs do not require either CSV. In particular, do not copy or
+publish the original clinical tables merely to run training.
 
 ## Inference input
 
-The internal and external inference scripts accept one image-level CSV. It must
-contain:
+Each released inference profile accepts one image-level CSV. It must contain:
 
 - `m_id`
 - `modality`
@@ -87,10 +80,16 @@ contain:
   - `masked_image_path` for `--use_mask_img`
   - `non-preprocessing` when none of those flags is used
 
-When `--use_mask_img` is selected and `masked_image_path` is absent, the
-inference code falls back to `preprocessing`. If a masked path is supplied,
-the visualization workflow looks for `lesion_mask_new.nii.gz` and then
-`lesion_mask.nii.gz` in the same directory.
+When `--use_mask_img` is selected, the image policy is explicit:
+`masked_image_path` is preferred row by row and `preprocessing` is used
+only when that row has no masked image. The code never labels a fallback row as
+an explicitly masked row. `coverage.json` records
+`explicit_masked_image_rows`, `preprocessing_fallback_rows`,
+`masked_image_column_present`, and the resolved `image_policy`.
+
+If a masked path is supplied, the visualization workflow looks for
+`lesion_mask_new.nii.gz` and then `lesion_mask.nii.gz` in the same
+directory.
 
 Inference preserves the source CSV position as `source_row` and assigns a
 contiguous `row_id` after modality, label, and image-path filtering. By default,
@@ -108,7 +107,26 @@ The single inference process writes outputs after exact row-coverage validation:
 - `prediction_patient_multimodal.csv`: training-aligned two-stage sMRI/dMRI
   probability ensemble
 - `coverage.json`: filtering, modality availability, and prediction coverage
-- `metrics.json`: scan- and patient-level metric summaries
+- `metrics.json`: scan- and patient-level generic metric summaries
+- `performance_report.json`: notebook-compatible primary, ablation, masking,
+  cohort, provenance, and metric contract
+- `performance_summary.csv`: tidy aggregate- and dataset-level metrics
+- `performance_report.md`: compact human-readable summary
+- `prediction_patient_report.csv`: patient predictions with cohort flags
+
+
+When `--defer_performance_report` is active, the final four report files are
+omitted from each GPU run. `coverage.json` then records
+`inference_complete`, `performance_report_status`, the report profile,
+image policy, prediction-row count, and shared final-report configuration.
+`summarize_inference_runs.py` consumes these completed scan-level outputs.
+`dataset_calibrated` selects fixed notebook-temperature sMRI results;
+`masking_raw` requires paired Public External profiles and selects raw FLAIR
+results on the identical seven-dataset masking cohort.
+The performance report uses only an allowlist of non-path manifest metadata;
+image paths are not copied into prediction artifacts. See
+[PERFORMANCE_REPORTING.md](PERFORMANCE_REPORTING.md) for the exact aggregation,
+calibration, Public External dataset, and masked/unmasked contracts.
 
 ## Structural MRI preprocessing input
 
@@ -147,6 +165,16 @@ The training and internal-inference jobs use:
 - SMI: `Da_smi`, `DePar_smi`, `DePerp_smi`, `f_smi`, `p2_smi`
 - WDKI: `ak_wdki`, `mk_wdki`, `rk_wdki`
 
-The external job mirrors the released structural-only deployment:
-`2DFLAIR_NCE`, `2DT1_NCE`, `3DT1_NCE`, `3DT1_CE`, and
-`3DFLAIR_NCE`.
+The released inference profiles are intentionally disjoint:
+
+| Profile | Manifest variable | Modalities | Image policy |
+| --- | --- | --- | --- |
+| Internal | `DEEPMS_INTERNAL_TEST_CSV` | Full structural, DTI, SMI, and WDKI set above | `preprocessing` |
+| Krakow/UJ | `DEEPMS_KRAKOW_TEST_CSV` | `3DT1_NCE`, `3DT1_CE`, `3DFLAIR_NCE` | `preprocessing` |
+| Public External, unmasked | `DEEPMS_PUBLIC_EXTERNAL_TEST_CSV` | `2DFLAIR_NCE`, `2DT1_NCE`, `3DT1_NCE`, `3DT1_CE`, `3DFLAIR_NCE` | `preprocessing` |
+| Public External, lesion-masked | `DEEPMS_PUBLIC_EXTERNAL_TEST_CSV` | Same Public External modalities | `masked_image_path`, then per-row `preprocessing` fallback |
+
+The two Public External launchers deliberately use the same manifest,
+checkpoint, modalities, and aggregation code. The unmasked profile passes
+`--use_preprocess`; the lesion-masked profile passes `--use_mask_img`.
+Their output directories are separate.

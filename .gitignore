@@ -19,6 +19,9 @@ slurm-*.err
 
 # Local configuration and editor files
 .env
+.local/
+scripts/slurm/*_local.sbatch
+scripts/slurm/**/*_local.sbatch
 .DS_Store
 .idea/
 .vscode/

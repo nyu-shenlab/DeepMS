@@ -138,10 +138,11 @@ DeepMS/
 ├── docs/                     # Data and metadata contracts
 ├── model/                    # Model architectures
 ├── preprocessing/            # Structural and diffusion MRI preprocessing
-├── scripts/slurm/            # Training and internal/external inference jobs
+├── scripts/slurm/            # Training and explicit inference-profile jobs
 ├── tests/                    # Unit tests and a two-process validation smoke test
-├── utils/                    # Dataset, schedule, and aggregation utilities
+├── utils/                    # Dataset, schedule, aggregation, and reporting
 ├── infer.py                  # Single-GPU inference entry point
+├── report_predictions.py     # Rebuild reports from saved scan predictions
 ├── train.py                  # Training entry point
 ├── pyproject.toml            # Direct and optional dependencies
 └── uv.lock                   # Fully resolved Linux x86_64 environment
@@ -223,14 +224,12 @@ structural workflow is GPU-gated because its default pipeline includes HD-BET.
 ### Training with Slurm
 
 The released job mirrors the full multimodal, two-GPU training configuration
-used by the development repository. Set the five required inputs and submit
+used by the development repository. Set the three required inputs and submit
 from the repository root:
 
 ```bash
 export DEEPMS_TRAIN_CSV=/path/to/train_images.csv
 export DEEPMS_VAL_CSV=/path/to/validation_images.csv
-export DEEPMS_DIAGNOSIS_CSV=/path/to/train_diagnoses.csv
-export DEEPMS_WM_LESION_CSV=/path/to/white_matter_lesions.csv
 export DEEPMS_PRETRAINED_PATH=/path/to/VoComni_B.pt
 
 sbatch scripts/slurm/train.sbatch
@@ -240,7 +239,8 @@ Optional controls include `DEEPMS_OUTPUT_ROOT`,
 `DEEPMS_RESUME_CHECKPOINT`, `DEEPMS_NUM_EPOCHS`,
 `DEEPMS_BATCH_SIZE`, `DEEPMS_VAL_BATCH_SIZE`, `DEEPMS_LEARNING_RATE`,
 `DEEPMS_MIN_LR`, `DEEPMS_GRADIENT_ACCUMULATION_STEPS`,
-`DEEPMS_AUC_METRIC`, `DEEPMS_SEED`, and `DEEPMS_FOLD`. Warmup is disabled
+`DEEPMS_AUC_METRIC`, `DEEPMS_SEED`, `DEEPMS_FOLD`, and space-separated
+`DEEPMS_MODALITIES` / `DEEPMS_VAL_MODALITIES`. Warmup is disabled
 by default. Set an exact `DEEPMS_WARMUP_STEPS`, or set
 `DEEPMS_USE_WARMUP=1` with `DEEPMS_WARMUP_EPOCHS`.
 
@@ -263,7 +263,96 @@ The script uses `uv run --locked --no-sync`: create the environment on the
 login node before submitting so compute jobs never mutate the environment or
 contact package indexes.
 
-### Internal inference with Slurm
+### Single-map diffusion ablation
+
+The training component uses the same three required variables as
+All ablation-specific launchers are grouped under
+[`scripts/slurm/ablation/`](scripts/slurm/ablation/README.md).
+`train.sbatch`. For a training-only manual launch, it submits 12 tasks with
+at most four running concurrently:
+
+```bash
+sbatch scripts/slurm/ablation/train_diffusion_ablation.sbatch
+```
+
+Array indices follow the requested order: SMI (`Da_smi`, `DePar_smi`,
+`DePerp_smi`, `f_smi`, `p2_smi`), DTI (`ad_dti`, `fa_dti`,
+`md_dti`, `rd_dti`), then DKI (`ak_wdki`, `mk_wdki`, `rk_wdki`).
+Every task uses the complete structural baseline plus exactly one diffusion
+map and receives its own `<family>/<map>` output directory. The historical
+DeepMS structural grouping includes `b0` by default; set
+`DEEPMS_INCLUDE_B0=0` for a strict T1/FLAIR-only baseline. Override the
+concurrency cap, for example, with `sbatch --array=0-11%2`.
+
+Final collection uses two explicit policies. Standard dataset evaluation uses
+`dataset_calibrated`: `notebook_primary` / sMRI / the fixed temperatures
+from the reference notebook. The paired lesion-masking experiment uses
+`masking_raw`: the exact seven-dataset `masking_comparable` cohort / FLAIR /
+raw logits, with no calibration before or after masking. The dMRI map remains a
+training ablation; inference is structural-only. See
+[docs/PERFORMANCE_REPORTING.md](docs/PERFORMANCE_REPORTING.md).
+
+### One-command ablation pipeline
+
+The recommended workflow is one submission. First create and edit the ignored
+site-local environment file; every evaluation ID must be unique:
+
+```bash
+cp configs/slurm.env.example .env
+# Replace all placeholders in .env.
+
+set -a
+source .env
+set +a
+
+export DEEPMS_ABLATION_EVAL_ID=public-external-ablation-v1
+export DEEPMS_PIPELINE_MODE=both
+
+sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
+```
+
+The lightweight CPU orchestration job validates required environment variables,
+input paths, mode compatibility, and fresh output destinations before its first
+child submission, then schedules this dependency
+graph:
+
+```text
+12-task training array
+  -> Public External unmasked inference array
+       -> calibrated dataset summary
+  -> Public External lesion-masked inference array
+       -> raw paired masking summary (waits for both inference arrays)
+```
+
+The unmasked inference is shared between the two summaries and is not run
+twice. All child jobs use `afterok`, so a failed training or inference array
+cannot start its downstream computation. Available modes are:
+
+| `DEEPMS_PIPELINE_MODE` | Automated workflow |
+| --- | --- |
+| `dataset_calibrated` | Train, infer one selected Internal/Krakow/Public External unmasked profile, then produce the 12-run calibrated summary. |
+| `masking_raw` | Train, infer Public External unmasked and masked profiles, then produce the 24-run raw paired summary. |
+| `both` | Train once, run the two Public External inference arrays, and produce both summaries. |
+
+The child arrays default to four concurrent tasks. Set
+`DEEPMS_ABLATION_CONCURRENCY` from 1 to 12 to change that cap. The pipeline
+uses an evaluation-specific training directory, refuses existing output roots,
+and records every child job ID under
+`outputs/slurm/pipelines/<evaluation-id>/pipeline_jobs.env`.
+
+For advanced manual operation, the component order remains
+`scripts/slurm/ablation/train_diffusion_ablation.sbatch` ->
+`scripts/slurm/ablation/infer_diffusion_ablation.sbatch` ->
+`scripts/slurm/ablation/summarize_inference_runs.sbatch`. The inference array locates exactly one
+`best_model.pth` per `<family>/<map>`, and the final summary still enforces
+complete run counts and exact patient/label fingerprints.
+
+### Inference with Slurm
+
+Each released inference profile requests one GPU and uses a distinct manifest
+variable, modality set, image policy, and output root.
+
+#### Internal
 
 ```bash
 export DEEPMS_MODEL_PATH=/path/to/best_model.pth
@@ -272,33 +361,84 @@ export DEEPMS_INTERNAL_TEST_CSV=/path/to/internal_test_images.csv
 sbatch scripts/slurm/infer_internal.sbatch
 ```
 
-The internal job evaluates the complete structural, DTI, SMI, and WDKI
-modality set. It requests one GPU and runs inference in one Python process. Set
-`DEEPMS_USE_CIS=1` only when label `2` should explicitly be mapped to the
-positive class; otherwise non-binary rows are excluded and counted.
+Internal inference uses the complete structural, DTI, SMI, and WDKI modality
+set with the `preprocessing` image column.
 
-### External inference with Slurm
+#### Krakow/UJ
 
 ```bash
 export DEEPMS_MODEL_PATH=/path/to/best_model.pth
-export DEEPMS_EXTERNAL_TEST_CSV=/path/to/external_test_images.csv
+export DEEPMS_KRAKOW_TEST_CSV=/path/to/krakow_test_images.csv
 
-sbatch scripts/slurm/infer_external.sbatch
+sbatch scripts/slurm/infer_krakow.sbatch
 ```
 
-The external job uses the structural-only deployment modalities from the
-released experiment. Lesion-masked inputs and NIfTI visualizations are enabled
-by default to match the reference job. Set
-`DEEPMS_USE_MASKED_IMAGES=0` and/or `DEEPMS_SAVE_VISUALIZATIONS=0` to
-disable them.
+This profile follows the Krakow/UJ reference job exactly:
+`3DT1_NCE`, `3DT1_CE`, and `3DFLAIR_NCE`, using
+`preprocessing` images. Its outputs are isolated under
+`outputs/inference/krakow/`.
 
-Both inference jobs request one GPU. `DEEPMS_BATCH_SIZE` is the ordinary
-inference-loader batch size and `DEEPMS_NUM_WORKERS` is the loader worker
-count.
+#### Public External: unmasked and lesion-masked
 
-All three jobs accept `DEEPMS_PROJECT_ROOT` when submitted outside the
-repository root and `DEEPMS_MIXED_PRECISION` (`no`, `fp16`, or `bf16`). Only
-the multi-GPU training job uses `DEEPMS_MASTER_PORT`.
+Both versions use the same checkpoint, manifest, modalities, label filtering,
+and aggregation code:
+
+```bash
+export DEEPMS_MODEL_PATH=/path/to/best_model.pth
+export DEEPMS_PUBLIC_EXTERNAL_TEST_CSV=/path/to/public_external_images.csv
+
+# Unmasked: read the preprocessing column.
+sbatch scripts/slurm/infer_public_external_unmasked.sbatch
+
+# Lesion-masked: prefer masked_image_path.
+sbatch scripts/slurm/infer_public_external_lesion_masked.sbatch
+```
+
+Both evaluate `2DFLAIR_NCE`, `2DT1_NCE`, `3DT1_NCE`, `3DT1_CE`,
+and `3DFLAIR_NCE`. The unmasked profile explicitly passes
+`--use_preprocess`; simply omitting every image-selection flag would instead
+select `non-preprocessing`.
+
+The lesion-masked profile always passes `--use_mask_img`. Following the
+released reference behavior, each row uses `masked_image_path` when available
+and otherwise records a `preprocessing` fallback. The exact seven-dataset
+masking-comparison cohort is stricter: every contributing FLAIR row must use an
+explicit masked image or report generation fails. `coverage.json` records the
+explicit masked-row and fallback-row counts. Outputs are isolated under
+`public-external-unmasked/` and `public-external-lesion-masked/`,
+respectively.
+
+NIfTI visualizations default to off for every inference profile. Set
+`DEEPMS_SAVE_VISUALIZATIONS=1` explicitly to enable them for a Slurm run. Set
+`DEEPMS_USE_CIS=1` only when label `2` should be mapped to the positive class;
+otherwise non-binary rows are excluded and counted.
+
+All profiles accept `DEEPMS_PROJECT_ROOT`, `DEEPMS_UV_BIN`,
+`DEEPMS_BATCH_SIZE`, `DEEPMS_NUM_WORKERS`,
+`DEEPMS_MIXED_PRECISION` (`no`, `fp16`, or `bf16`), and
+`DEEPMS_REPORT_BOOTSTRAPS`.
+
+By default, each successful inference immediately writes its notebook-compatible
+patient-level report, cohort/per-dataset metrics, and bootstrap intervals. Set
+`DEEPMS_DEFER_PERFORMANCE_REPORT=1` to save only predictions and completion
+metadata; the diffusion ablation inference array forces this mode so metrics
+are computed once in the dependent final summary. `coverage.json` records
+`inference_complete=true`, its report profile, and the exact image policy.
+Profile-specific image policies are always validated. Historical
+`prediction_all_modalities.csv` files can be reported without another GPU run:
+
+```bash
+uv run --locked --no-sync python report_predictions.py --help
+```
+
+Validate the environment, manifest filtering, modalities, and masked/fallback
+counts without loading a model:
+
+```bash
+DEEPMS_PREFLIGHT_ONLY=1 bash scripts/slurm/infer_krakow.sbatch
+DEEPMS_PREFLIGHT_ONLY=1 bash scripts/slurm/infer_public_external_unmasked.sbatch
+DEEPMS_PREFLIGHT_ONLY=1 bash scripts/slurm/infer_public_external_lesion_masked.sbatch
+```
 
 ### Tests and preflight checks
 
@@ -308,10 +448,16 @@ Install the development group, then run the full deterministic suite:
 uv sync --locked
 uv run --locked python -m pytest -q
 uv run --locked ruff check .
-bash -n scripts/slurm/*.sbatch
+find scripts/slurm -name '*.sbatch' -exec bash -n {} \;
 sbatch --test-only scripts/slurm/train.sbatch
+sbatch --test-only scripts/slurm/ablation/train_diffusion_ablation.sbatch
+sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch --test-only scripts/slurm/infer_internal.sbatch
-sbatch --test-only scripts/slurm/infer_external.sbatch
+sbatch --test-only scripts/slurm/infer_krakow.sbatch
+sbatch --test-only scripts/slurm/infer_public_external_unmasked.sbatch
+sbatch --test-only scripts/slurm/infer_public_external_lesion_masked.sbatch
+sbatch --test-only scripts/slurm/ablation/infer_diffusion_ablation.sbatch
+sbatch --test-only scripts/slurm/ablation/summarize_inference_runs.sbatch
 ```
 
 The tests include a real two-process CPU launch that calls the production
@@ -326,11 +472,25 @@ by default, including TensorBoard logs, update-aware resume checkpoints,
 `best_model.pth`, and `final_model.pth`.
 
 Inference writes per-modality and combined scan-level predictions plus four
-explicit patient-level tables: patient-modality, flat-logit, structural-MRI,
-and the training-aligned two-stage multimodal ensemble. `metrics.json` records
-metrics at each level, while `coverage.json` records requested, excluded,
-missing-modality, predicted-row, and predicted-patient counts. Optional NIfTI
+generic patient-level tables: patient-modality, flat-logit, structural-MRI, and
+the training-aligned two-stage multimodal ensemble. `metrics.json` records
+metrics at each generic level, while `coverage.json` records requested,
+excluded, missing-modality, predicted-row, and predicted-patient counts.
+
+The notebook-compatible report is separate and explicit:
+`performance_report.json`, `performance_summary.csv`,
+`performance_report.md`, and `prediction_patient_report.csv`. It records the
+headline, ablation, and masking result keys as well as exact cohort definitions
+and image-source provenance. See
+[docs/PERFORMANCE_REPORTING.md](docs/PERFORMANCE_REPORTING.md). Optional NIfTI
 visualizations are written under `visualizations/` using row-specific paths.
+
+A final summary directory contains `ablation_performance_summary.csv`,
+`ablation_performance_metrics.csv`, `ablation_performance_report.json`,
+`ablation_performance_report.md`, and an atomic `_SUCCESS` marker.
+`masking_raw` additionally writes `masking_pairwise_deltas.csv`. These
+artifacts are published only after the expected run count and exact
+patient/label cohort fingerprints pass.
 
 Model weights and clinical data are not distributed in this repository. The
 VoCo initialization is available from the

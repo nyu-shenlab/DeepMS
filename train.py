@@ -142,9 +142,19 @@ def get_args():
         help="Deprecated compatibility option; image paths are read from the metadata CSV.",
     )
     parser.add_argument("--train_patient_ids", type=str, required=True, help="Training image metadata CSV.")
-    parser.add_argument("--train_diagnosis_df", type=str, required=True, help="Patient-level diagnosis CSV.")
     parser.add_argument("--val_patient_ids", type=str, required=True, help="Validation image metadata CSV.")
-    parser.add_argument("--white_matter_list", type=str, required=True, help="Patient-level WM-lesion CSV.")
+    parser.add_argument(
+        "--train_diagnosis_df",
+        type=str,
+        default=None,
+        help="Deprecated compatibility option; not used by the active training pipeline.",
+    )
+    parser.add_argument(
+        "--white_matter_list",
+        type=str,
+        default=None,
+        help="Deprecated compatibility option; not used by the active training pipeline.",
+    )
 
     parser.add_argument("--output_path", type=str, default="./outputs")
     parser.add_argument("--pretrained_path", type=str, default="pretrain_weights/VoCo/VoComni_B.pt")
@@ -281,50 +291,19 @@ def prepare_datasets(args, logger, accelerator):
     try:
         train_df = pd.read_csv(args.train_patient_ids, dtype={"m_id": "string"})
         val_df = pd.read_csv(args.val_patient_ids, dtype={"m_id": "string"})
-        white_matter_df = pd.read_csv(args.white_matter_list, dtype={"m_id": "string"})
     except Exception as e:
         raise FileNotFoundError(f"Error loading dataset metadata: {e}")
 
-    # -----------------------------------------------------------------
-    # Merge WM lesion metadata
-    # -----------------------------------------------------------------
-    white_matter_df = white_matter_df[["m_id", "wm_lesion"]].copy()
-    white_matter_df.columns = ["m_id", "white_matter_lesion"]
+    if accelerator.is_main_process and (
+        args.train_diagnosis_df is not None or args.white_matter_list is not None
+    ):
+        logger.warning(
+            "--train_diagnosis_df and --white_matter_list are deprecated compatibility "
+            "options and are not used by the active training pipeline."
+        )
 
     train_df = train_df[train_df["modality"].isin(args.modalities)].copy()
     val_df = val_df[val_df["modality"].isin(args.val_modalities)].copy()
-
-    train_df = train_df.merge(white_matter_df, on="m_id", how="left")
-    train_df["white_matter_lesion"] = train_df["white_matter_lesion"].fillna(0)
-    train_df.loc[
-        (train_df["ms"] == 1) & (train_df["white_matter_lesion"] != 1),
-        "white_matter_lesion"
-    ] = 1
-
-    # -----------------------------------------------------------------
-    # Add diagnosis metadata
-    # -----------------------------------------------------------------
-    used_cols = [
-        "m_id",
-        "migraine",
-        "cerebral_vessel",
-        "NMOSD",
-        "mog",
-        "other_demylin",
-        "unspecified_demyelinating",
-    ]
-    train_diagnosis_df = pd.read_csv(
-        args.train_diagnosis_df, usecols=used_cols, dtype={"m_id": "string"}
-    )
-    train_df = train_df.merge(train_diagnosis_df, on="m_id", how="left", validate="m:1")
-
-    flag_cols = used_cols[1:]
-    train_df.loc[:, flag_cols] = train_df[flag_cols].fillna(0).astype(int)
-
-    mask_ms = train_df["ms"].eq(1)
-    other_flags = ["migraine", "cerebral_vessel", "NMOSD", "mog", "other_demylin"]
-    mask_others = train_df[other_flags].eq(1).any(axis=1) & train_df["unspecified_demyelinating"].eq(0)
-    train_df = train_df.assign(important_diagnosis=(mask_ms | mask_others).astype("int8"))
 
     # -----------------------------------------------------------------
     # Modality indices / modality families
@@ -396,8 +375,6 @@ def prepare_datasets(args, logger, accelerator):
         "Sex",
         "structural_mri",
         "SMI",
-        "white_matter_lesion",
-        "important_diagnosis",
         "2D_images",
         "image",
         "modality_label",

@@ -24,7 +24,8 @@ fail() {
     exit 1
 }
 
-command -v uv >/dev/null 2>&1 || fail "uv is not available on PATH."
+UV_BIN="${DEEPMS_UV_BIN:-uv}"
+command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
 [[ -f pyproject.toml && -f uv.lock && -f train.py ]] || \
     fail "Submit from the DeepMS repository root or set DEEPMS_PROJECT_ROOT."
 [[ -x .venv/bin/python ]] || \
@@ -33,8 +34,6 @@ command -v uv >/dev/null 2>&1 || fail "uv is not available on PATH."
 REQUIRED_VARS=(
     DEEPMS_TRAIN_CSV
     DEEPMS_VAL_CSV
-    DEEPMS_DIAGNOSIS_CSV
-    DEEPMS_WM_LESION_CSV
     DEEPMS_PRETRAINED_PATH
 )
 for name in "${REQUIRED_VARS[@]}"; do
@@ -88,6 +87,29 @@ DTI_MODALITIES=(ad_dti fa_dti md_dti rd_dti)
 SMI_MODALITIES=(Da_smi DePar_smi DePerp_smi f_smi p2_smi)
 DKI_MODALITIES=(ak_wdki mk_wdki rk_wdki)
 
+if [[ -n "${DEEPMS_MODALITIES:-}" ]]; then
+    read -r -a TRAIN_MODALITIES <<< "${DEEPMS_MODALITIES}"
+else
+    TRAIN_MODALITIES=(
+        "${SMRI_MODALITIES[@]}"
+        "${DTI_MODALITIES[@]}"
+        "${SMI_MODALITIES[@]}"
+        "${DKI_MODALITIES[@]}"
+    )
+fi
+if [[ -n "${DEEPMS_VAL_MODALITIES:-}" ]]; then
+    read -r -a VALIDATION_MODALITIES <<< "${DEEPMS_VAL_MODALITIES}"
+else
+    VALIDATION_MODALITIES=(
+        "${SMRI_VAL_MODALITIES[@]}"
+        "${DTI_MODALITIES[@]}"
+        "${SMI_MODALITIES[@]}"
+        "${DKI_MODALITIES[@]}"
+    )
+fi
+(( ${#TRAIN_MODALITIES[@]} > 0 )) || fail "No training modalities were selected."
+(( ${#VALIDATION_MODALITIES[@]} > 0 )) || fail "No validation modalities were selected."
+
 SCHEDULE_ARGS=(
     --min_lr "${MIN_LR}"
     --warmup_start_lr "${WARMUP_START_LR}"
@@ -106,10 +128,21 @@ if [[ -n "${DEEPMS_RESUME_CHECKPOINT:-}" ]]; then
     RESUME_ARGS=(--continue_training "${DEEPMS_RESUME_CHECKPOINT}")
 fi
 
-UV_RUN=(uv run --locked --no-sync)
+UV_RUN=("${UV_BIN}" run --locked --no-sync)
 
 printf 'DeepMS root: %s\n' "${PROJECT_ROOT}"
 printf 'Slurm job: %s | master port: %s\n' "${SLURM_JOB_ID:-local}" "${MASTER_PORT}"
+printf 'Training modalities: %s\n' "${TRAIN_MODALITIES[*]}"
+printf 'Validation modalities: %s\n' "${VALIDATION_MODALITIES[*]}"
+case "${DEEPMS_PREFLIGHT_ONLY:-0}" in
+    1)
+        "${UV_RUN[@]}" python "${PROJECT_ROOT}/train.py" --help >/dev/null
+        printf 'Preflight passed; no training process was started.\n'
+        exit 0
+        ;;
+    0) ;;
+    *) fail "DEEPMS_PREFLIGHT_ONLY must be 0 or 1." ;;
+esac
 "${UV_RUN[@]}" python -c \
     'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpus={torch.cuda.device_count()}")'
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -121,20 +154,10 @@ srun "${UV_RUN[@]}" accelerate launch \
     --main_process_port "${MASTER_PORT}" \
     --mixed_precision "${MIXED_PRECISION}" \
     "${PROJECT_ROOT}/train.py" \
-    --modalities \
-        "${SMRI_MODALITIES[@]}" \
-        "${DTI_MODALITIES[@]}" \
-        "${SMI_MODALITIES[@]}" \
-        "${DKI_MODALITIES[@]}" \
-    --val_modalities \
-        "${SMRI_VAL_MODALITIES[@]}" \
-        "${DTI_MODALITIES[@]}" \
-        "${SMI_MODALITIES[@]}" \
-        "${DKI_MODALITIES[@]}" \
+    --modalities "${TRAIN_MODALITIES[@]}" \
+    --val_modalities "${VALIDATION_MODALITIES[@]}" \
     --train_patient_ids "${DEEPMS_TRAIN_CSV}" \
     --val_patient_ids "${DEEPMS_VAL_CSV}" \
-    --train_diagnosis_df "${DEEPMS_DIAGNOSIS_CSV}" \
-    --white_matter_list "${DEEPMS_WM_LESION_CSV}" \
     --pretrained_path "${DEEPMS_PRETRAINED_PATH}" \
     --output_path "${OUTPUT_ROOT}" \
     --num_epochs "${NUM_EPOCHS}" \

@@ -28,6 +28,12 @@ from utils.evaluation import (
     json_safe,
     validate_prediction_coverage,
 )
+from utils.reporting import (
+    REPORT_PROFILES,
+    attach_manifest_metadata,
+    save_performance_report,
+    validate_report_image_policy,
+)
 from utils.transforms import FilterImages
 
 # -----------------------------------------------------------------------------
@@ -141,6 +147,60 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="./visualizations",
         help="Directory to save visualization NIfTI files.",
+    )
+    parser.add_argument(
+        "--report_profile",
+        choices=REPORT_PROFILES,
+        default="generic",
+        help=(
+            "Dataset/cohort contract for the automatic notebook-compatible "
+            "performance report."
+        ),
+    )
+    parser.add_argument(
+        "--report_cohort_overrides",
+        default=None,
+        help=(
+            "Optional CSV with m_id plus include and/or label_override; "
+            "used only by the performance report."
+        ),
+    )
+    parser.add_argument(
+        "--report_bootstrap_samples",
+        type=int,
+        default=2000,
+        help="Deterministic bootstrap samples for aggregate-cohort 95%% CIs.",
+    )
+    parser.add_argument(
+        "--report_seed",
+        type=int,
+        default=42,
+        help="Random seed used by performance-report bootstrap confidence intervals.",
+    )
+    parser.add_argument(
+        "--report_threshold",
+        type=float,
+        default=0.5,
+        help="Patient-level probability threshold for report operating metrics.",
+    )
+    parser.add_argument(
+        "--report_target_fpr",
+        type=float,
+        default=0.01,
+        help="Target FPR used for partial AUC and operating-point reporting.",
+    )
+    parser.add_argument(
+        "--defer_performance_report",
+        action="store_true",
+        help=(
+            "Save completed predictions and defer notebook-compatible metrics "
+            "to summarize_inference_runs.py."
+        ),
+    )
+    parser.add_argument(
+        "--preflight_only",
+        action="store_true",
+        help="Validate the manifest and resolved image policy without loading a model.",
     )
 
     return parser.parse_args()
@@ -290,14 +350,31 @@ def prepare_test_dataframe(args: argparse.Namespace) -> pd.DataFrame:
         df["Sex"] = 0
     if "Age" not in df.columns:
         df["Age"] = 0
-    df["Sex"] = df["Sex"].fillna(0).replace({"F": 1, "M": 0}).astype(int)
+    sex_values = df["Sex"].apply(
+        lambda value: {"F": 1, "M": 0}.get(value, value)
+    )
+    df["Sex"] = pd.to_numeric(sex_values, errors="coerce").fillna(0).astype(int)
     df["Age"] = df["Age"].fillna(0)
 
+    for path_column in (
+        "non-preprocessing",
+        "bet",
+        "preprocessing",
+        "masked_image_path",
+    ):
+        if path_column in df.columns:
+            df[path_column] = df[path_column].replace(r"^\s*$", pd.NA, regex=True)
+
+    masked_image_column_present = "masked_image_path" in df.columns
     df["mask_path"] = 0
-    if "masked_image_path" in df.columns:
-        df.loc[df["masked_image_path"].notna(), "mask_path"] = 1
+    if masked_image_column_present:
+        explicit_masked_rows = df["masked_image_path"].notna()
+        df.loc[explicit_masked_rows, "mask_path"] = 1
         if "preprocessing" in df.columns:
-            df.loc[df["masked_image_path"].isna(), "masked_image_path"] = df["preprocessing"]
+            fallback_rows = df["masked_image_path"].isna()
+            df.loc[fallback_rows, "masked_image_path"] = df.loc[
+                fallback_rows, "preprocessing"
+            ]
     elif "preprocessing" in df.columns:
         df["masked_image_path"] = df["preprocessing"]
     else:
@@ -313,6 +390,17 @@ def prepare_test_dataframe(args: argparse.Namespace) -> pd.DataFrame:
         required_col = "non-preprocessing"
     if required_col not in df.columns:
         raise ValueError(f"Required column '{required_col}' not found in test CSV.")
+    df["masked_image_available"] = df["mask_path"].eq(1)
+    df["used_masked_image"] = bool(args.use_mask_img) & df["mask_path"].eq(1)
+    df["used_preprocessing_fallback"] = (
+        bool(args.use_mask_img) & df["mask_path"].eq(0)
+    )
+    if args.use_mask_img:
+        df["image_source"] = np.where(
+            df["used_masked_image"], "masked_image_path", "preprocessing_fallback"
+        )
+    else:
+        df["image_source"] = required_col
     df["image"] = df[required_col]
     rows_before_path_filter = len(df)
     df = df[df["image"].notna()].copy()
@@ -327,6 +415,21 @@ def prepare_test_dataframe(args: argparse.Namespace) -> pd.DataFrame:
 
     df = df.reset_index(drop=True)
     df["row_id"] = np.arange(len(df), dtype=np.int64)
+    masked_image_rows = (
+        int(df["mask_path"].eq(1).sum()) if args.use_mask_img else 0
+    )
+    preprocessing_fallback_rows = (
+        int(df["mask_path"].eq(0).sum()) if args.use_mask_img else 0
+    )
+    image_policy = (
+        "masked_image_path_then_preprocessing"
+        if args.use_mask_img
+        else required_col
+    )
+    validate_report_image_policy(
+        getattr(args, "report_profile", "generic"),
+        image_policy,
+    )
     df.attrs["input_coverage"] = {
         "input_rows": int(len(raw)),
         "requested_modality_rows": int(requested_rows_before_label_filter),
@@ -340,6 +443,10 @@ def prepare_test_dataframe(args: argparse.Namespace) -> pd.DataFrame:
         "missing_modalities": sorted(set(args.modalities) - set(df["modality"])),
         "cis_mapped_to_positive": bool(args.use_cis),
         "image_column": required_col,
+        "image_policy": image_policy,
+        "masked_image_column_present": masked_image_column_present,
+        "explicit_masked_image_rows": masked_image_rows,
+        "preprocessing_fallback_rows": preprocessing_fallback_rows,
     }
     return df
 
@@ -738,6 +845,7 @@ def run_test_inference(
         if accelerator.is_main_process:
             if result_df is None or result_df.empty:
                 raise RuntimeError(f"No inference results for modality {modality}.")
+            result_df = attach_manifest_metadata(result_df, modality_df)
             summarize_activation_statistics(result_df, modality)
             modality_csv = os.path.join(
                 args.output_dir, f"prediction_{modality}.csv"
@@ -794,6 +902,24 @@ def save_ensemble_outputs(
 # Main
 # -----------------------------------------------------------------------------
 def main(args: argparse.Namespace) -> None:
+    if args.preflight_only:
+        setup_logging(is_main_process=True)
+        test_df = prepare_test_dataframe(args)
+        input_coverage = dict(test_df.attrs.get("input_coverage", {}))
+        logging.info(
+            "Inference manifest preflight: %s",
+            json.dumps(json_safe(input_coverage), sort_keys=True, allow_nan=False),
+        )
+        if input_coverage.get("preprocessing_fallback_rows", 0):
+            logging.warning(
+                "The masked-image policy will use preprocessing fallback for %d rows.",
+                input_coverage["preprocessing_fallback_rows"],
+            )
+        logging.info(
+            "Preflight passed; no model was loaded and no inference was started."
+        )
+        return
+
     dataloader_config = DataLoaderConfiguration(
         even_batches=False,
         non_blocking=True,
@@ -819,6 +945,16 @@ def main(args: argparse.Namespace) -> None:
     image_size = get_image_size(args)
     test_df = prepare_test_dataframe(args)
     input_coverage = dict(test_df.attrs.get("input_coverage", {}))
+    if accelerator.is_main_process:
+        logging.info(
+            "Input coverage: %s",
+            json.dumps(json_safe(input_coverage), sort_keys=True, allow_nan=False),
+        )
+        if input_coverage.get("preprocessing_fallback_rows", 0):
+            logging.warning(
+                "The masked-image policy is using preprocessing fallback for %d rows.",
+                input_coverage["preprocessing_fallback_rows"],
+            )
     all_results_df = run_test_inference(
         test_df=test_df,
         args=args,
@@ -830,8 +966,68 @@ def main(args: argparse.Namespace) -> None:
         if all_results_df is None:
             raise RuntimeError("Main process did not receive inference results.")
         metrics = save_ensemble_outputs(all_results_df, args.output_dir)
+        performance_report_status = "deferred"
+        if args.defer_performance_report:
+            logging.info(
+                "Notebook-compatible performance reporting is deferred to the "
+                "final cross-run summary job."
+            )
+        else:
+            performance_report = save_performance_report(
+                all_results_df,
+                output_dir=args.output_dir,
+                profile=args.report_profile,
+                image_policy=str(input_coverage["image_policy"]),
+                threshold=args.report_threshold,
+                target_fpr=args.report_target_fpr,
+                bootstrap_samples=args.report_bootstrap_samples,
+                seed=args.report_seed,
+                cohort_overrides_csv=args.report_cohort_overrides,
+            )
+            performance_report_status = "completed"
+            primary_report = performance_report["primary"]
+            logging.info(
+                "Notebook-compatible primary report: cohort=%s ensemble=%s "
+                "calibration=%s patients=%d ROC-AUC=%s PR-AUC=%s",
+                primary_report["cohort"],
+                primary_report["ensemble"],
+                primary_report["calibration"],
+                primary_report["n_patients"],
+                primary_report["roc_auc"],
+                primary_report["pr_auc"],
+            )
+            ablation_selector = performance_report["ablation_contract"][
+                "recommended_selector"
+            ]
+            ablation_report = performance_report["ablation_results"][
+                ablation_selector
+            ]
+            logging.info(
+                "Recommended ablation report: selector=%s patients=%d "
+                "ROC-AUC=%s PR-AUC=%s",
+                ablation_selector,
+                ablation_report["n_patients"],
+                ablation_report["roc_auc"],
+                ablation_report["pr_auc"],
+            )
+            logging.info(
+                "Saved notebook-compatible report artifacts under: %s",
+                args.output_dir,
+            )
         input_coverage["predicted_rows"] = int(len(all_results_df))
         input_coverage["predicted_patients"] = int(all_results_df["m_id"].nunique())
+        input_coverage["performance_report_profile"] = args.report_profile
+        input_coverage["performance_report_status"] = performance_report_status
+        input_coverage["inference_complete"] = True
+        input_coverage["report_configuration"] = {
+            "profile": args.report_profile,
+            "image_policy": str(input_coverage["image_policy"]),
+            "bootstrap_samples": args.report_bootstrap_samples,
+            "seed": args.report_seed,
+            "threshold": args.report_threshold,
+            "target_fpr": args.report_target_fpr,
+            "cohort_overrides_configured": bool(args.report_cohort_overrides),
+        }
         input_coverage["prediction_rows_by_modality"] = {
             str(key): int(value)
             for key, value in all_results_df["modality"].value_counts().sort_index().items()

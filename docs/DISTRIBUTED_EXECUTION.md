@@ -2,9 +2,9 @@
 
 DeepMS uses Hugging Face Accelerate for single-node data-parallel training. The
 released training job requests two GPUs and starts one launcher task;
-Accelerate then creates one Python process per GPU. The released internal and
-external inference jobs intentionally request one GPU and run `infer.py`
-directly in one Python process.
+Accelerate then creates one Python process per GPU. The released Internal,
+Krakow/UJ, Public External unmasked, and Public External lesion-masked profiles
+each request one GPU and run `infer.py` directly in one Python process.
 
 ## Training batch and learning-rate contract
 
@@ -69,11 +69,16 @@ Validation reports four checkpoint-selection choices:
 ## Inference execution
 
 The released inference jobs intentionally use one GPU; multi-GPU inference is
-not required for the documented workflow. `infer.py` still assigns stable row
-IDs, verifies exact prediction coverage, keeps patient/modality aggregation
-explicit, and has one writer for CSV and JSON outputs. Visualization paths
-include the stable row ID to prevent multiple scans from overwriting one
-another.
+not required for the documented workflow. Internal, Krakow/UJ, and Public
+External unmasked use `preprocessing`. Public External lesion-masked uses the
+explicit `masked_image_path_then_preprocessing` policy. Its coverage artifact
+reports how many selected rows used a masked image and how many used the
+documented fallback.
+
+`infer.py` assigns stable row IDs, verifies exact prediction coverage, keeps
+patient/modality aggregation explicit, and has one writer for CSV and JSON
+outputs. Visualization paths include the stable row ID to prevent multiple
+scans from overwriting one another.
 
 ## Aggregation contract
 
@@ -88,8 +93,42 @@ ambiguous "ensemble":
    modality families within dMRI and then equally averages available sMRI and
    dMRI branches.
 
-Repeated scans therefore do not receive extra weight merely because a patient
-has more acquisitions of one modality.
+In this generic hierarchy, repeated scans therefore do not receive extra weight
+merely because a patient has more acquisitions of one modality. The separate
+notebook-compatible contract below intentionally starts from original scan rows
+to reproduce the reference analysis.
+
+## Notebook-compatible performance report
+
+By default, rank zero reproduces the analysis_final_1016_new.ipynb contract
+after the generic aggregation files are complete: mean logits within FLAIR,
+T1-CE, and T1-NCE; equal mean over available structural groups; then one
+sigmoid at patient level. Raw and fixed notebook-temperature results are both
+retained. With `--defer_performance_report`, rank zero records completed
+predictions and the report configuration but leaves this calculation to the
+final collection job.
+
+Per-run JSON retains the calibrated headline, four FLAIR/sMRI audit rows, and
+the exact lesion-masking comparison. The final collector exposes only two
+modes: `dataset_calibrated` selects fixed notebook-temperature sMRI on
+`notebook_primary`; `masking_raw` selects uncalibrated FLAIR on the exact
+seven-dataset `masking_comparable` cohort. The masked profile also fails if a
+contributing FLAIR row lacks explicit masked-image provenance. Full details are
+in [PERFORMANCE_REPORTING.md](PERFORMANCE_REPORTING.md).
+
+The recommended entry point is
+`scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch`. It is a small CPU
+orchestration job: it does not hold GPUs while waiting, but submits the child
+arrays and summaries as an `afterok` graph. It uses one unique training and
+inference root per evaluation ID and records all child job IDs in a state file.
+For the single-map ablation workflow, the GPU inference array forces deferred
+reporting. Each task writes predictions plus `coverage.json` with
+`inference_complete=true`. A CPU-only `afterok` job requires 12 calibrated
+dataset runs or 24 paired masking runs, recomputes notebook metrics once, and
+validates exact patient/label hashes. In masking mode it additionally requires
+one unmasked and one masked result for every checkpoint and writes
+`masked - unmasked` deltas. The summary fails closed on missing tasks,
+pairing errors, or cohort drift.
 
 ## Verification
 
@@ -99,7 +138,7 @@ Run the deterministic test suite on a login or CPU compute node:
 uv sync --locked
 uv run --locked python -m pytest -q
 uv run --locked ruff check .
-bash -n scripts/slurm/*.sbatch
+find scripts/slurm -name '*.sbatch' -exec bash -n {} \;
 ```
 
 The pytest suite includes a two-process CPU launch that directly exercises the

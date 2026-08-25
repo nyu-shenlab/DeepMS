@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=deepms-internal
+#SBATCH --job-name=deepms-krakow
 #SBATCH --output=slurm-%x-%j.out
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=02:00:00
-#SBATCH --partition=a100_short
+#SBATCH --partition=a100_dev
 #SBATCH --gres=gpu:1
 
 set -euo pipefail
@@ -30,12 +30,12 @@ command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
     fail "Missing .venv. Run: uv sync --locked --no-dev"
 
 : "${DEEPMS_MODEL_PATH:?Set DEEPMS_MODEL_PATH to best_model.pth}"
-: "${DEEPMS_INTERNAL_TEST_CSV:?Set DEEPMS_INTERNAL_TEST_CSV to the internal metadata CSV}"
+: "${DEEPMS_KRAKOW_TEST_CSV:?Set DEEPMS_KRAKOW_TEST_CSV to the Krakow/UJ metadata CSV}"
 [[ -f "${DEEPMS_MODEL_PATH}" ]] || fail "Checkpoint not found: ${DEEPMS_MODEL_PATH}"
-[[ -f "${DEEPMS_INTERNAL_TEST_CSV}" ]] || fail "Test CSV not found: ${DEEPMS_INTERNAL_TEST_CSV}"
+[[ -f "${DEEPMS_KRAKOW_TEST_CSV}" ]] || fail "Test CSV not found: ${DEEPMS_KRAKOW_TEST_CSV}"
 
-OUTPUT_DIR="${DEEPMS_INFERENCE_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/inference/internal/job-${SLURM_JOB_ID:-manual}}"
-VISUALIZATION_DIR="${DEEPMS_VISUALIZATION_DIR:-${PROJECT_ROOT}/visualizations/internal/job-${SLURM_JOB_ID:-manual}}"
+OUTPUT_DIR="${DEEPMS_INFERENCE_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/inference/krakow/job-${SLURM_JOB_ID:-manual}}"
+VISUALIZATION_DIR="${DEEPMS_VISUALIZATION_DIR:-${PROJECT_ROOT}/visualizations/krakow/job-${SLURM_JOB_ID:-manual}}"
 NUM_WORKERS="${DEEPMS_NUM_WORKERS:-4}"
 MIXED_PRECISION="${DEEPMS_MIXED_PRECISION:-fp16}"
 
@@ -44,16 +44,7 @@ case "${MIXED_PRECISION}" in
     *) fail "DEEPMS_MIXED_PRECISION must be no, fp16, or bf16." ;;
 esac
 
-MODALITIES=(
-    2DT1_NCE 2DT1_CE
-    2DFLAIR_NCE 2DFLAIR_CE
-    3DT1_NCE 3DT1_CE
-    3DFLAIR_NCE 3DFLAIR_CE
-    b0
-    ad_dti fa_dti md_dti rd_dti
-    Da_smi DePar_smi DePerp_smi f_smi p2_smi
-    ak_wdki mk_wdki rk_wdki
-)
+MODALITIES=(3DT1_NCE 3DT1_CE 3DFLAIR_NCE)
 
 CIS_ARGS=()
 case "${DEEPMS_USE_CIS:-0}" in
@@ -71,6 +62,7 @@ case "${DEEPMS_SAVE_VISUALIZATIONS:-0}" in
     *) fail "DEEPMS_SAVE_VISUALIZATIONS must be 0 or 1." ;;
 esac
 
+UV_RUN=("${UV_BIN}" run --locked --no-sync)
 REPORT_ARGS=()
 case "${DEEPMS_DEFER_PERFORMANCE_REPORT:-0}" in
     1) REPORT_ARGS=(--defer_performance_report) ;;
@@ -78,21 +70,11 @@ case "${DEEPMS_DEFER_PERFORMANCE_REPORT:-0}" in
     *) fail "DEEPMS_DEFER_PERFORMANCE_REPORT must be 0 or 1." ;;
 esac
 
-REPORT_OVERRIDE_ARGS=()
-if [[ -n "${DEEPMS_REPORT_COHORT_OVERRIDES:-}" ]]; then
-    [[ -f "${DEEPMS_REPORT_COHORT_OVERRIDES}" ]] || \
-        fail "Report cohort override CSV not found: ${DEEPMS_REPORT_COHORT_OVERRIDES}"
-    REPORT_OVERRIDE_ARGS=(
-        --report_cohort_overrides "${DEEPMS_REPORT_COHORT_OVERRIDES}"
-    )
-fi
-
-UV_RUN=("${UV_BIN}" run --locked --no-sync)
 INFER_COMMAND=(
     "${UV_RUN[@]}" python "${PROJECT_ROOT}/infer.py"
     --modalities "${MODALITIES[@]}"
     --model_paths "${DEEPMS_MODEL_PATH}"
-    --test_patient_ids "${DEEPMS_INTERNAL_TEST_CSV}"
+    --test_patient_ids "${DEEPMS_KRAKOW_TEST_CSV}"
     --output_dir "${OUTPUT_DIR}"
     --use_preprocess
     --direct_resize
@@ -107,18 +89,17 @@ INFER_COMMAND=(
     --num_heads 2
     --loss_type bce_with_logits
     --mixed_precision "${MIXED_PRECISION}"
-    --report_profile internal
+    --report_profile krakow
     --report_bootstrap_samples "${DEEPMS_REPORT_BOOTSTRAPS:-2000}"
     "${REPORT_ARGS[@]}"
-    "${REPORT_OVERRIDE_ARGS[@]}"
     "${VISUALIZATION_ARGS[@]}"
     "${CIS_ARGS[@]}"
 )
 
-printf 'Inference profile: Internal\n'
+printf 'Inference profile: Krakow/UJ\n'
 printf 'Image policy: preprocessing\n'
 printf 'Modalities: %s\n' "${MODALITIES[*]}"
-printf 'Test CSV: %s\n' "${DEEPMS_INTERNAL_TEST_CSV}"
+printf 'Test CSV: %s\n' "${DEEPMS_KRAKOW_TEST_CSV}"
 printf 'Output: %s\n' "${OUTPUT_DIR}"
 
 case "${DEEPMS_PREFLIGHT_ONLY:-0}" in
