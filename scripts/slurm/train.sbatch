@@ -24,12 +24,13 @@ fail() {
     exit 1
 }
 
-UV_BIN="${DEEPMS_UV_BIN:-uv}"
-command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
-[[ -f pyproject.toml && -f uv.lock && -f train.py ]] || \
+[[ -f train.py ]] || \
     fail "Submit from the DeepMS repository root or set DEEPMS_PROJECT_ROOT."
-[[ -x .venv/bin/python ]] || \
-    fail "Missing .venv. Run: uv sync --locked --no-dev"
+RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
+[[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
+# shellcheck disable=SC1090
+source "${RUNTIME_ENVIRONMENT}"
+deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 REQUIRED_VARS=(
     DEEPMS_TRAIN_CSV
@@ -135,8 +136,6 @@ if [[ -n "${DEEPMS_RESUME_CHECKPOINT:-}" ]]; then
         fail "Resume checkpoint not found: ${DEEPMS_RESUME_CHECKPOINT}"
     RESUME_ARGS=(--continue_training "${DEEPMS_RESUME_CHECKPOINT}")
 fi
-
-UV_RUN=("${UV_BIN}" run --locked --no-sync)
 
 printf 'DeepMS root: %s\n' "${PROJECT_ROOT}"
 printf 'Slurm job: %s | master port: %s\n' "${SLURM_JOB_ID:-local}" "${MASTER_PORT}"

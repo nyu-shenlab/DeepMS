@@ -27,8 +27,11 @@ UV_BIN="${DEEPMS_UV_BIN:-uv}"
 command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
 [[ -f pyproject.toml && -f uv.lock ]] || \
     fail "Submit from the DeepMS repository root or set DEEPMS_PROJECT_ROOT."
-[[ -x .venv/bin/python ]] || \
-    fail "Missing .venv. Run: uv sync --locked --no-dev"
+RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
+[[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
+# shellcheck disable=SC1090
+source "${RUNTIME_ENVIRONMENT}"
+deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 ABLATION_SLURM_DIR="${PROJECT_ROOT}/scripts/slurm/ablation"
 TRAIN_JOB="${ABLATION_SLURM_DIR}/train_diffusion_ablation.sbatch"

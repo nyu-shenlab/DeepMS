@@ -162,12 +162,20 @@ Clone the repository and create the core training/inference environment:
 ```bash
 git clone https://github.com/nyu-shenlab/DeepMS.git
 cd DeepMS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Start a new shell if `uv` is not immediately available on PATH.
 uv sync --locked --no-dev
+./scripts/bootstrap_env.sh --check
 ```
 
 The project pins Python 3.11 and the direct package versions used in the
 original `preprocessing` Conda environment. The lockfile also fixes all
-transitive dependencies.
+transitive dependencies. Each collaborator creates their own environment from
+the committed lockfile; `.venv` is never copied or shared. As a one-command
+alternative, `./scripts/bootstrap_env.sh` performs the locked core sync and
+then validates the resulting environment. See
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) for external-cluster setup,
+scratch-hosted environments, and dependency updates.
 
 Install the optional preprocessing tools, including ANTsPy and HD-BET 2.0.1:
 
@@ -185,10 +193,10 @@ uv sync --locked --no-dev --extra tracking
 Verify the environment without starting a job:
 
 ```bash
-uv run --locked --no-dev python -c \
+uv run --locked --no-sync python -c \
   "import torch, monai; print(torch.__version__, torch.version.cuda, monai.__version__)"
-uv run --locked --no-dev python train.py --help
-uv run --locked --no-dev python infer.py --help
+uv run --locked --no-sync python train.py --help
+uv run --locked --no-sync python infer.py --help
 ```
 
 ### Data preparation
@@ -262,7 +270,9 @@ batch, schedule, validation, and aggregation contracts.
 
 The script uses `uv run --locked --no-sync`: create the environment on the
 login node before submitting so compute jobs never mutate the environment or
-contact package indexes.
+contact package indexes. Every job audits the actual pinned distributions and
+imports PyTorch; an empty or partially synchronized `.venv` cannot pass
+preflight merely because its Python executable exists.
 
 ### Single-map diffusion ablation
 
@@ -296,11 +306,15 @@ training ablation; inference is structural-only. See
 ### One-command ablation pipeline
 
 The recommended workflow is one submission. On Shenlab, the committed site
-profile already contains the verified shared GPFS inputs. After creating the
-locked uv environment, submit the site launcher directly from the clone root:
+profile contains the verified shared GPFS inputs, but deliberately does not
+point to another user's Python environment or `uv` executable. Install `uv`
+under your own account, create the locked environment once, then submit the
+site launcher directly from the clone root:
 
 ```bash
-/gpfs/data/shenlab/Jiajian/software/miniconda3/bin/uv sync --locked --no-dev
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Start a new shell if `uv` is not immediately available on PATH.
+./scripts/bootstrap_env.sh
 sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 ```
@@ -323,10 +337,11 @@ sbatch --test-only scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 ```
 
-The lightweight CPU orchestration job validates required environment variables,
-input paths, mode compatibility, and fresh output destinations before its first
-child submission, then schedules this dependency
-graph:
+The lightweight CPU orchestration job validates the existing locked Python
+environment, required environment variables, input paths, mode compatibility,
+and fresh output destinations before its first child submission. It never
+installs packages; environment synchronization remains an explicit user action.
+It then schedules this dependency graph:
 
 ```text
 12-task training array

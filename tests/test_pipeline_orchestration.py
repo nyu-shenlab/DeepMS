@@ -225,3 +225,25 @@ def test_pipeline_preflight_failure_submits_no_child_jobs(
     assert completed.returncode != 0
     assert commands == []
     assert not state_file.exists()
+
+
+def test_incomplete_environment_submits_no_child_jobs(tmp_path: Path) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(
+        tmp_path,
+        mode="both",
+    )
+    environment["DEEPMS_UV_BIN"] = "false"
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "locked environment is incomplete" in completed.stderr
+    assert not command_log.exists() or not command_log.read_text(encoding="utf-8").strip()
+    assert not state_file.exists()

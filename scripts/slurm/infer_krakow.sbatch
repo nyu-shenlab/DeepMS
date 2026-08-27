@@ -22,12 +22,13 @@ fail() {
     exit 1
 }
 
-UV_BIN="${DEEPMS_UV_BIN:-uv}"
-command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
-[[ -f pyproject.toml && -f uv.lock && -f infer.py ]] || \
+[[ -f infer.py ]] || \
     fail "Submit from the DeepMS repository root or set DEEPMS_PROJECT_ROOT."
-[[ -x .venv/bin/python ]] || \
-    fail "Missing .venv. Run: uv sync --locked --no-dev"
+RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
+[[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
+# shellcheck disable=SC1090
+source "${RUNTIME_ENVIRONMENT}"
+deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 : "${DEEPMS_MODEL_PATH:?Set DEEPMS_MODEL_PATH to best_model.pth}"
 : "${DEEPMS_KRAKOW_TEST_CSV:?Set DEEPMS_KRAKOW_TEST_CSV to the Krakow/UJ metadata CSV}"
@@ -62,7 +63,6 @@ case "${DEEPMS_SAVE_VISUALIZATIONS:-0}" in
     *) fail "DEEPMS_SAVE_VISUALIZATIONS must be 0 or 1." ;;
 esac
 
-UV_RUN=("${UV_BIN}" run --locked --no-sync)
 REPORT_ARGS=()
 case "${DEEPMS_DEFER_PERFORMANCE_REPORT:-0}" in
     1) REPORT_ARGS=(--defer_performance_report) ;;

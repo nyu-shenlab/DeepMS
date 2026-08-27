@@ -171,6 +171,7 @@ def test_one_command_pipeline_is_cpu_only_and_dependency_driven() -> None:
     assert "DEEPMS_ABLATION_OUTPUT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "DEEPMS_ABLATION_CHECKPOINT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "PIPELINE_STATUS=scheduled" in pipeline
+    assert "runtime_environment.sh" in pipeline
 
 
 def test_inference_profiles_are_explicit_and_disjoint() -> None:
@@ -259,6 +260,9 @@ def test_public_slurm_assets_do_not_embed_site_specific_paths() -> None:
         SLURM_DIR / "infer_public_external_lesion_masked.sbatch",
         REPOSITORY_ROOT / "configs" / "slurm.env.example",
         ABLATION_SLURM_DIR / "run_diffusion_ablation_pipeline.sbatch",
+        SLURM_DIR / "runtime_environment.sh",
+        REPOSITORY_ROOT / "scripts" / "bootstrap_env.sh",
+        REPOSITORY_ROOT / "scripts" / "check_environment.py",
     ]
     for path in public_assets:
         assert "/gpfs/" not in path.read_text(encoding="utf-8"), path

@@ -10,16 +10,21 @@ directory and are called by these wrappers.
 ```bash
 git clone https://github.com/nyu-shenlab/DeepMS.git
 cd DeepMS
-/gpfs/data/shenlab/Jiajian/software/miniconda3/bin/uv sync --locked --no-dev
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Start a new shell if `uv` is not immediately available on PATH.
+./scripts/bootstrap_env.sh
 
 sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 ```
 
 The launcher automatically loads the committed Shenlab profile, uses the shared
-GPFS inputs, derives the project root from the current clone, generates a
-timestamped evaluation ID, and submits the complete dependency graph. It does
-not contain credentials or clinical records.
+GPFS inputs, resolves the `uv` installed by the current user, derives the
+project root from the current clone, generates a timestamped evaluation ID,
+and submits the complete dependency graph. It does not contain credentials or
+clinical records. The CPU launcher validates the locked environment before
+creating any GPU child jobs; it deliberately does not install packages inside
+Slurm.
 
 On another cluster, load a site-local copy of the portable template instead:
 
