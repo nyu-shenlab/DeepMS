@@ -21,6 +21,8 @@ def _fake_pipeline_environment(
     counter = tmp_path / "sbatch-counter"
     counter.write_text("1000", encoding="utf-8")
     command_log = tmp_path / "sbatch-commands.log"
+    scontrol_log = tmp_path / "scontrol-commands.log"
+    scancel_log = tmp_path / "scancel-commands.log"
     fake_sbatch = fake_bin / "sbatch"
     fake_sbatch.write_text(
         """#!/usr/bin/env bash
@@ -29,11 +31,35 @@ job_id="$(( $(<"${FAKE_SBATCH_COUNTER}") + 1 ))"
 printf '%s' "${job_id}" > "${FAKE_SBATCH_COUNTER}"
 printf '%q ' "$@" >> "${FAKE_SBATCH_LOG}"
 printf '\n' >> "${FAKE_SBATCH_LOG}"
+if [[ "${FAKE_SBATCH_FAIL_CALL:-0}" == "${job_id}" ]]; then
+    printf 'simulated sbatch failure\n' >&2
+    exit 1
+fi
 printf '%s;test-cluster\n' "${job_id}"
 """,
         encoding="utf-8",
     )
     fake_sbatch.chmod(0o755)
+    fake_scontrol = fake_bin / "scontrol"
+    fake_scontrol.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >> "${FAKE_SCONTROL_LOG}"
+printf '\n' >> "${FAKE_SCONTROL_LOG}"
+""",
+        encoding="utf-8",
+    )
+    fake_scontrol.chmod(0o755)
+    fake_scancel = fake_bin / "scancel"
+    fake_scancel.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '%q ' "$@" >> "${FAKE_SCANCEL_LOG}"
+printf '\n' >> "${FAKE_SCANCEL_LOG}"
+""",
+        encoding="utf-8",
+    )
+    fake_scancel.chmod(0o755)
 
     input_files: dict[str, str] = {}
     for variable in (
@@ -57,6 +83,8 @@ printf '%s;test-cluster\n' "${job_id}"
             "PATH": f"{fake_bin}:{environment.get('PATH', '')}",
             "FAKE_SBATCH_COUNTER": str(counter),
             "FAKE_SBATCH_LOG": str(command_log),
+            "FAKE_SCONTROL_LOG": str(scontrol_log),
+            "FAKE_SCANCEL_LOG": str(scancel_log),
             "SLURM_JOB_ID": "9000",
             "SLURM_SUBMIT_DIR": str(REPOSITORY_ROOT),
             "DEEPMS_PROJECT_ROOT": str(REPOSITORY_ROOT),
@@ -147,6 +175,8 @@ def test_both_pipeline_reuses_unmasked_inference_and_schedules_two_summaries(
     assert completed.returncode == 0, completed.stderr
     assert len(commands) == 5
     training, unmasked, masked, dataset_summary, masking_summary = commands
+    assert all("--hold" in command for command in commands)
+    assert all("--no-requeue" in command for command in commands)
     assert training[-1].endswith("train_diffusion_ablation.sbatch")
     assert "--dependency=aftercorr:1001" in unmasked
     assert "--dependency=aftercorr:1001" in masked
@@ -170,6 +200,39 @@ def test_both_pipeline_reuses_unmasked_inference_and_schedules_two_summaries(
     assert "MASKED_INFER_JOB_ID=1003" in state
     assert "DATASET_SUMMARY_JOB_ID=1004" in state
     assert "MASKING_SUMMARY_JOB_ID=1005" in state
+
+    releases = [
+        shlex.split(line) for line in (tmp_path / "scontrol-commands.log").read_text(encoding="utf-8").splitlines()
+    ]
+    assert releases == [
+        ["release", "1004"],
+        ["release", "1005"],
+        ["release", "1002"],
+        ["release", "1003"],
+        ["release", "1001"],
+    ]
+
+
+def test_partial_graph_submission_cancels_only_held_jobs_from_this_run(tmp_path: Path) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(tmp_path, mode="both")
+    environment["FAKE_SBATCH_FAIL_CALL"] = "1003"
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    commands = [shlex.split(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
+    assert len(commands) == 3
+    assert all("--hold" in command for command in commands)
+    cancelled = shlex.split((tmp_path / "scancel-commands.log").read_text(encoding="utf-8"))
+    assert cancelled == ["1001", "1002"]
+    assert "PIPELINE_STATUS=rolled_back" in state_file.read_text(encoding="utf-8")
 
 
 def test_shenlab_launcher_loads_a_site_profile_and_submits_the_full_graph(
@@ -298,8 +361,5 @@ def test_empty_training_exclude_list_adds_no_sbatch_exclusion(tmp_path: Path) ->
     )
 
     assert completed.returncode == 0, completed.stderr
-    commands = [
-        shlex.split(line)
-        for line in command_log.read_text(encoding="utf-8").splitlines()
-    ]
+    commands = [shlex.split(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
     assert not any(argument.startswith("--exclude=") for argument in commands[0])

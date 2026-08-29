@@ -10,6 +10,7 @@ from scripts.check_environment import REPOSITORY_ROOT, audit_environment
 BOOTSTRAP = REPOSITORY_ROOT / "scripts" / "bootstrap_env.sh"
 RUNTIME_ENVIRONMENT = REPOSITORY_ROOT / "scripts" / "slurm" / "runtime_environment.sh"
 SHENLAB_PROFILE = REPOSITORY_ROOT / "configs" / "slurm.shenlab.env"
+EXPECTED_COMMIT = "a" * 40
 
 
 def _fake_uv(tmp_path: Path) -> tuple[Path, Path]:
@@ -25,6 +26,56 @@ printf '\n' >> "${FAKE_UV_LOG}"
     )
     executable.chmod(0o755)
     return executable, command_log
+
+
+def _run_guarded_source_check(
+    tmp_path: Path,
+    *,
+    current_commit: str = EXPECTED_COMMIT,
+    git_status: str = "",
+) -> subprocess.CompletedProcess[str]:
+    fake_git = tmp_path / "git"
+    fake_git.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+    *" rev-parse --verify HEAD") printf '%s\n' "${FAKE_CURRENT_COMMIT}" ;;
+    *" status --porcelain --untracked-files=normal") printf '%s' "${FAKE_GIT_STATUS}" ;;
+    *) printf 'unexpected fake git call: %s\n' "$*" >&2; exit 2 ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DEEPMS_GIT_BIN": str(fake_git),
+            "DEEPMS_GUARDED_EXPECTED_COMMIT": EXPECTED_COMMIT,
+            "FAKE_CURRENT_COMMIT": current_commit,
+            "FAKE_GIT_STATUS": git_status,
+            "FAKE_PROJECT_ROOT": str(project_root),
+            "RUNTIME_ENVIRONMENT_PATH": str(RUNTIME_ENVIRONMENT),
+        }
+    )
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+set -euo pipefail
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+source "${RUNTIME_ENVIRONMENT_PATH}"
+deepms_verify_guarded_source_tree "${FAKE_PROJECT_ROOT}"
+""",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def _run_bootstrap(tmp_path: Path, *arguments: str) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
@@ -45,10 +96,7 @@ def _run_bootstrap(tmp_path: Path, *arguments: str) -> tuple[subprocess.Complete
         capture_output=True,
         check=False,
     )
-    commands = [
-        shlex.split(line)
-        for line in command_log.read_text(encoding="utf-8").splitlines()
-    ]
+    commands = [shlex.split(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
     return completed, commands
 
 
@@ -107,12 +155,65 @@ def test_slurm_runtime_is_validation_only_and_supports_custom_uv_environments() 
         REPOSITORY_ROOT / "scripts/slurm/infer_public_external_unmasked.sbatch",
         REPOSITORY_ROOT / "scripts/slurm/infer_public_external_lesion_masked.sbatch",
         REPOSITORY_ROOT / "scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch",
+        REPOSITORY_ROOT / "scripts/slurm/ablation/submit_shenlab_ablation.sbatch",
         REPOSITORY_ROOT / "scripts/slurm/ablation/summarize_inference_runs.sbatch",
     ]
     for job in jobs:
         text = job.read_text(encoding="utf-8")
         assert "runtime_environment.sh" in text
+        assert 'deepms_verify_guarded_source_tree "${PROJECT_ROOT}"' in text
         assert ".venv/bin/python" not in text
+
+
+def test_guarded_source_check_accepts_exact_commit_with_clean_worktree(tmp_path: Path) -> None:
+    completed = _run_guarded_source_check(tmp_path)
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_guarded_source_check_is_a_noop_without_expected_commit(tmp_path: Path) -> None:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DEEPMS_GIT_BIN": str(tmp_path / "missing-git"),
+            "FAKE_PROJECT_ROOT": str(tmp_path),
+            "RUNTIME_ENVIRONMENT_PATH": str(RUNTIME_ENVIRONMENT),
+        }
+    )
+    environment.pop("DEEPMS_GUARDED_EXPECTED_COMMIT", None)
+
+    completed = subprocess.run(
+        [
+            "bash",
+            "-c",
+            """
+set -euo pipefail
+fail() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+source "${RUNTIME_ENVIRONMENT_PATH}"
+deepms_verify_guarded_source_tree "${FAKE_PROJECT_ROOT}"
+""",
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_guarded_source_check_rejects_commit_drift(tmp_path: Path) -> None:
+    completed = _run_guarded_source_check(tmp_path, current_commit="b" * 40)
+
+    assert completed.returncode != 0
+    assert "Repository HEAD changed after guarded submission" in completed.stderr
+
+
+def test_guarded_source_check_rejects_dirty_worktree(tmp_path: Path) -> None:
+    completed = _run_guarded_source_check(tmp_path, git_status=" M train.py")
+
+    assert completed.returncode != 0
+    assert "Repository worktree changed after guarded submission" in completed.stderr
 
 
 def test_shenlab_setup_uses_each_collaborators_own_uv_installation() -> None:

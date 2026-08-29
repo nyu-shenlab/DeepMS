@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
 #SBATCH --time=00:10:00
@@ -34,6 +35,13 @@ SITE_PROFILE="${DEEPMS_SITE_PROFILE:-${PROJECT_ROOT}/configs/slurm.shenlab.env}"
 source "${SITE_PROFILE}"
 [[ "${DEEPMS_PROJECT_ROOT}" == "$(pwd -P)" ]] || \
     fail "The site profile did not resolve to this DeepMS clone."
+
+RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
+[[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
+# shellcheck disable=SC1090
+source "${RUNTIME_ENVIRONMENT}"
+deepms_verify_guarded_source_tree "${PROJECT_ROOT}"
+deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 PIPELINE_JOB="${PROJECT_ROOT}/scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch"
 [[ -f "${PIPELINE_JOB}" ]] || fail "Pipeline job not found: ${PIPELINE_JOB}"

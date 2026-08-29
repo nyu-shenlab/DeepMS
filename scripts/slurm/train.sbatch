@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=96G
 #SBATCH --time=72:00:00
@@ -30,6 +31,7 @@ RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
 [[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
 # shellcheck disable=SC1090
 source "${RUNTIME_ENVIRONMENT}"
+deepms_verify_guarded_source_tree "${PROJECT_ROOT}"
 deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 REQUIRED_VARS=(
@@ -61,7 +63,15 @@ AUC_METRIC="${DEEPMS_AUC_METRIC:-micro}"
 SEED="${DEEPMS_SEED:-88}"
 FOLD="${DEEPMS_FOLD:-1}"
 JOB_ID="${SLURM_JOB_ID:-0}"
-MASTER_PORT="${DEEPMS_MASTER_PORT:-$((20000 + JOB_ID % 20000))}"
+ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+    # Slurm array elements can share a node while using different allocated
+    # GPUs. Derive the rendezvous port from the job and task IDs so an ambient
+    # DEEPMS_MASTER_PORT cannot make independent jobs collide.
+    MASTER_PORT="$((20000 + (JOB_ID + ARRAY_TASK_ID) % 20000))"
+else
+    MASTER_PORT="${DEEPMS_MASTER_PORT:-29500}"
+fi
 
 case "${MIXED_PRECISION}" in
     no|fp16|bf16) ;;

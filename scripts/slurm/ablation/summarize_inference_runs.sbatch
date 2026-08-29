@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=04:00:00
@@ -27,6 +28,7 @@ RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
 [[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
 # shellcheck disable=SC1090
 source "${RUNTIME_ENVIRONMENT}"
+deepms_verify_guarded_source_tree "${PROJECT_ROOT}"
 deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 : "${DEEPMS_INFERENCE_RUNS_ROOT:?Set DEEPMS_INFERENCE_RUNS_ROOT to the completed inference collection}"

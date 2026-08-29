@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=02:00:00
@@ -28,6 +29,7 @@ RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
 [[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
 # shellcheck disable=SC1090
 source "${RUNTIME_ENVIRONMENT}"
+deepms_verify_guarded_source_tree "${PROJECT_ROOT}"
 deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 : "${DEEPMS_MODEL_PATH:?Set DEEPMS_MODEL_PATH to best_model.pth}"
@@ -118,10 +120,11 @@ if [[ "${DEEPMS_SAVE_VISUALIZATIONS:-0}" == "1" ]]; then
 fi
 
 printf 'Slurm job: %s | inference: single GPU\n' "${SLURM_JOB_ID:-local}"
-"${UV_RUN[@]}" python -c \
-    'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpus={torch.cuda.device_count()}")'
+CUDA_PREFLIGHT="${PROJECT_ROOT}/scripts/check_cuda_devices.py"
+[[ -f "${CUDA_PREFLIGHT}" ]] || fail "CUDA preflight helper not found: ${CUDA_PREFLIGHT}"
 if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi
 fi
+"${UV_RUN[@]}" python "${CUDA_PREFLIGHT}" --expected 1
 
 srun "${INFER_COMMAND[@]}"

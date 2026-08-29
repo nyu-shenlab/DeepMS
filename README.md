@@ -305,24 +305,28 @@ training ablation; inference is structural-only. See
 
 ### One-command ablation pipeline
 
-The recommended workflow is one submission. On Shenlab, the committed site
-profile contains the verified shared GPFS inputs, but deliberately does not
-point to another user's Python environment or `uv` executable. Install `uv`
-under your own account, create the locked environment once, then submit the
-site launcher directly from the clone root:
+The recommended workflow is one checked submission. On Shenlab, the committed
+site profile contains the verified shared GPFS inputs, but deliberately does
+not point to another user's Python environment or `uv` executable. Install
+`uv` under your own account and create the locked environment once:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 # Start a new shell if `uv` is not immediately available on PATH.
 ./scripts/bootstrap_env.sh
-sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
-sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
+
+# Check Git, inputs, environment, and live Slurm request acceptance; no jobs.
+./scripts/slurm/ablation/guarded_shenlab_ablation.sh
+
+# Submit and return only after the complete child graph is live in Slurm.
+./scripts/slurm/ablation/guarded_shenlab_ablation.sh --submit
 ```
 
-The launcher sources `configs/slurm.shenlab.env`, derives
-`DEEPMS_PROJECT_ROOT` from the current clone, generates a timestamped evaluation
-ID, and starts the complete dependency graph. The GPFS inputs require Shenlab
-access; no credentials or clinical records are stored in the repository.
+The command refreshes the upstream Git reference and refuses dirty, stale, or
+divergent code. It sources `configs/slurm.shenlab.env`, validates each Slurm
+request with `--test-only`, generates a collision-resistant evaluation ID, and
+starts the complete dependency graph. The GPFS inputs require Shenlab access;
+no credentials or clinical records are stored in the repository.
 
 Other sites should copy `configs/slurm.env.example`, replace its placeholders,
 and submit the portable orchestration job:
@@ -339,9 +343,10 @@ sbatch scripts/slurm/ablation/run_diffusion_ablation_pipeline.sbatch
 
 The lightweight CPU orchestration job validates the existing locked Python
 environment, required environment variables, input paths, mode compatibility,
-and fresh output destinations before its first child submission. It never
-installs packages; environment synchronization remains an explicit user action.
-It then schedules this dependency graph:
+and fresh output destinations. It never installs packages. Child jobs are
+submitted on hold; if the graph is incomplete, they are cancelled before any
+compute is released. After the full graph is valid, downstream jobs are
+released first and training last:
 
 ```text
 12-task training array
@@ -352,8 +357,9 @@ It then schedules this dependency graph:
 ```
 
 The unmasked inference is shared between the two summaries and is not run
-twice. All child jobs use `afterok`, so a failed training or inference array
-cannot start its downstream computation. Available modes are:
+twice. Inference arrays use task-correlated `aftercorr` dependencies; summaries
+use `afterok`. All downstream jobs use `--kill-on-invalid-dep=yes`, so a failed
+upstream task cannot leave unusable work pending indefinitely. Available modes are:
 
 | `DEEPMS_PIPELINE_MODE` | Automated workflow |
 | --- | --- |

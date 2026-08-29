@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%A_%a.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=24G
 #SBATCH --time=02:00:00

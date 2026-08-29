@@ -1,6 +1,34 @@
 #!/usr/bin/env bash
 
 # Source this file after PROJECT_ROOT and fail() have been defined.
+deepms_verify_guarded_source_tree() {
+    local project_root="$1"
+    local expected_commit="${DEEPMS_GUARDED_EXPECTED_COMMIT:-}"
+    local git_bin
+    local current_commit
+    local git_status
+
+    [[ -n "${expected_commit}" ]] || return 0
+    [[ "${expected_commit}" =~ ^[0-9a-f]{40}$ ]] || \
+        fail "Invalid guarded expected Git commit: ${expected_commit}"
+
+    git_bin="${DEEPMS_GIT_BIN:-git}"
+    command -v "${git_bin}" >/dev/null 2>&1 || \
+        fail "git is unavailable for the guarded source-tree check: ${git_bin}"
+    [[ -x "${git_bin}" ]] || fail "Git executable is not runnable: ${git_bin}"
+
+    current_commit="$("${git_bin}" -C "${project_root}" rev-parse --verify HEAD)" || \
+        fail "Could not resolve the current Git commit under ${project_root}."
+    [[ "${current_commit}" == "${expected_commit}" ]] || \
+        fail "Repository HEAD changed after guarded submission: expected ${expected_commit}, found ${current_commit}."
+
+    git_status="$(
+        "${git_bin}" -C "${project_root}" status --porcelain --untracked-files=normal
+    )" || fail "Could not inspect the guarded Git worktree under ${project_root}."
+    [[ -z "${git_status}" ]] || \
+        fail "Repository worktree changed after guarded submission; refusing to mix source versions."
+}
+
 deepms_activate_locked_environment() {
     local project_root="$1"
     local environment_check="${project_root}/scripts/check_environment.py"

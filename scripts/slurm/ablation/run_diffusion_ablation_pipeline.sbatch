@@ -4,6 +4,7 @@
 #SBATCH --error=slurm-%x-%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
+#SBATCH --no-requeue
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
 #SBATCH --time=00:10:00
@@ -22,7 +23,9 @@ fail() {
 
 [[ -n "${SLURM_JOB_ID:-}" ]] || \
     fail "Submit this orchestration job with sbatch."
-command -v sbatch >/dev/null 2>&1 || fail "sbatch is not available."
+for command_name in sbatch scontrol scancel; do
+    command -v "${command_name}" >/dev/null 2>&1 || fail "${command_name} is not available."
+done
 UV_BIN="${DEEPMS_UV_BIN:-uv}"
 command -v "${UV_BIN}" >/dev/null 2>&1 || fail "uv is not available: ${UV_BIN}"
 [[ -f pyproject.toml && -f uv.lock ]] || \
@@ -31,6 +34,7 @@ RUNTIME_ENVIRONMENT="${PROJECT_ROOT}/scripts/slurm/runtime_environment.sh"
 [[ -f "${RUNTIME_ENVIRONMENT}" ]] || fail "Runtime environment helper not found: ${RUNTIME_ENVIRONMENT}"
 # shellcheck disable=SC1090
 source "${RUNTIME_ENVIRONMENT}"
+deepms_verify_guarded_source_tree "${PROJECT_ROOT}"
 deepms_activate_locked_environment "${PROJECT_ROOT}"
 
 ABLATION_SLURM_DIR="${PROJECT_ROOT}/scripts/slurm/ablation"
@@ -91,6 +95,7 @@ fi
 EVALUATION_ID="${DEEPMS_ABLATION_EVAL_ID:-pipeline-${SLURM_JOB_ID}}"
 [[ "${EVALUATION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
     fail "DEEPMS_ABLATION_EVAL_ID must be one safe path component."
+RUN_TAG="${EVALUATION_ID:0:32}"
 
 CONCURRENCY="${DEEPMS_ABLATION_CONCURRENCY:-4}"
 [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || \
@@ -125,7 +130,7 @@ mkdir -p "${STATE_ROOT}"
 mkdir "${STATE_DIR}" || fail "Evaluation ID is already reserved: ${EVALUATION_ID}"
 STATE_FILE="${STATE_DIR}/pipeline_jobs.env"
 {
-    printf 'PIPELINE_STATUS=submitting\n'
+    printf 'PIPELINE_STATUS=submitting_held\n'
     printf 'PIPELINE_MODE=%q\n' "${PIPELINE_MODE}"
     printf 'EVALUATION_ID=%q\n' "${EVALUATION_ID}"
     printf 'TRAIN_ROOT=%q\n' "${TRAIN_ROOT}"
@@ -133,6 +138,30 @@ STATE_FILE="${STATE_DIR}/pipeline_jobs.env"
     printf 'ARRAY_SPEC=%q\n' "${ARRAY_SPEC}"
     printf 'TRAIN_EXCLUDE_NODES=%q\n' "${TRAIN_EXCLUDE_NODES}"
 } > "${STATE_FILE}"
+
+GRAPH_RELEASED=0
+SUBMITTED_JOB_IDS=()
+rollback_partial_graph() {
+    local exit_status=$?
+    local cancel_status=0
+    trap - EXIT
+    if (( GRAPH_RELEASED == 0 )); then
+        set +e
+        if (( ${#SUBMITTED_JOB_IDS[@]} > 0 )); then
+            scancel "${SUBMITTED_JOB_IDS[@]}"
+            cancel_status=$?
+        fi
+        if (( cancel_status == 0 )); then
+            printf 'PIPELINE_STATUS=rolled_back\n' >> "${STATE_FILE}"
+        else
+            printf 'PIPELINE_STATUS=rollback_failed\n' >> "${STATE_FILE}"
+            printf 'ERROR: Could not cancel every held partial-graph job: %s\n' \
+                "${SUBMITTED_JOB_IDS[*]}" >&2
+        fi
+    fi
+    exit "${exit_status}"
+}
+trap rollback_partial_graph EXIT
 
 parse_job_id() {
     local response="$1"
@@ -151,6 +180,9 @@ submit_training() {
     export_spec+=",DEEPMS_PREFLIGHT_ONLY=0"
     submit_args=(
         --parsable
+        --hold
+        --no-requeue
+        --job-name="deepms-train-${RUN_TAG}"
         --array="${ARRAY_SPEC}"
         --export="${export_spec}"
     )
@@ -177,6 +209,9 @@ submit_inference() {
     response="$(
         sbatch \
             --parsable \
+            --hold \
+            --no-requeue \
+            --job-name="deepms-infer-${profile:0:12}-${RUN_TAG}" \
             --array="${ARRAY_SPEC}" \
             --dependency="aftercorr:${training_job_id}" \
             --kill-on-invalid-dep=yes \
@@ -203,6 +238,9 @@ submit_summary() {
     response="$(
         sbatch \
             --parsable \
+            --hold \
+            --no-requeue \
+            --job-name="deepms-summary-${evaluation_mode:0:8}-${RUN_TAG}" \
             --dependency="${dependency}" \
             --kill-on-invalid-dep=yes \
             --export="${export_spec}" \
@@ -212,8 +250,9 @@ submit_summary() {
 }
 
 TRAIN_JOB_ID="$(submit_training)"
+SUBMITTED_JOB_IDS+=("${TRAIN_JOB_ID}")
 printf 'TRAIN_JOB_ID=%q\n' "${TRAIN_JOB_ID}" >> "${STATE_FILE}"
-printf 'Submitted training array: %s\n' "${TRAIN_JOB_ID}"
+printf 'Submitted held training array: %s\n' "${TRAIN_JOB_ID}"
 
 DATASET_INFER_JOB_ID=""
 UNMASKED_INFER_JOB_ID=""
@@ -224,6 +263,7 @@ MASKING_SUMMARY_JOB_ID=""
 case "${PIPELINE_MODE}" in
     dataset_calibrated)
         DATASET_INFER_JOB_ID="$(submit_inference "${DATASET_PROFILE}" "${TRAIN_JOB_ID}")"
+        SUBMITTED_JOB_IDS+=("${DATASET_INFER_JOB_ID}")
         printf 'DATASET_INFER_JOB_ID=%q\n' "${DATASET_INFER_JOB_ID}" >> "${STATE_FILE}"
         DATASET_SUMMARY_JOB_ID="$(
             submit_summary \
@@ -232,11 +272,14 @@ case "${PIPELINE_MODE}" in
                 12 \
                 "afterok:${DATASET_INFER_JOB_ID}"
         )"
+        SUBMITTED_JOB_IDS+=("${DATASET_SUMMARY_JOB_ID}")
         printf 'DATASET_SUMMARY_JOB_ID=%q\n' "${DATASET_SUMMARY_JOB_ID}" >> "${STATE_FILE}"
         ;;
     masking_raw)
         UNMASKED_INFER_JOB_ID="$(submit_inference public_external_unmasked "${TRAIN_JOB_ID}")"
+        SUBMITTED_JOB_IDS+=("${UNMASKED_INFER_JOB_ID}")
         MASKED_INFER_JOB_ID="$(submit_inference public_external_masked "${TRAIN_JOB_ID}")"
+        SUBMITTED_JOB_IDS+=("${MASKED_INFER_JOB_ID}")
         printf 'UNMASKED_INFER_JOB_ID=%q\n' "${UNMASKED_INFER_JOB_ID}" >> "${STATE_FILE}"
         printf 'MASKED_INFER_JOB_ID=%q\n' "${MASKED_INFER_JOB_ID}" >> "${STATE_FILE}"
         MASKING_SUMMARY_JOB_ID="$(
@@ -246,11 +289,14 @@ case "${PIPELINE_MODE}" in
                 24 \
                 "afterok:${UNMASKED_INFER_JOB_ID}:${MASKED_INFER_JOB_ID}"
         )"
+        SUBMITTED_JOB_IDS+=("${MASKING_SUMMARY_JOB_ID}")
         printf 'MASKING_SUMMARY_JOB_ID=%q\n' "${MASKING_SUMMARY_JOB_ID}" >> "${STATE_FILE}"
         ;;
     both)
         UNMASKED_INFER_JOB_ID="$(submit_inference public_external_unmasked "${TRAIN_JOB_ID}")"
+        SUBMITTED_JOB_IDS+=("${UNMASKED_INFER_JOB_ID}")
         MASKED_INFER_JOB_ID="$(submit_inference public_external_masked "${TRAIN_JOB_ID}")"
+        SUBMITTED_JOB_IDS+=("${MASKED_INFER_JOB_ID}")
         printf 'UNMASKED_INFER_JOB_ID=%q\n' "${UNMASKED_INFER_JOB_ID}" >> "${STATE_FILE}"
         printf 'MASKED_INFER_JOB_ID=%q\n' "${MASKED_INFER_JOB_ID}" >> "${STATE_FILE}"
         DATASET_SUMMARY_JOB_ID="$(
@@ -260,6 +306,7 @@ case "${PIPELINE_MODE}" in
                 12 \
                 "afterok:${UNMASKED_INFER_JOB_ID}"
         )"
+        SUBMITTED_JOB_IDS+=("${DATASET_SUMMARY_JOB_ID}")
         MASKING_SUMMARY_JOB_ID="$(
             submit_summary \
                 masking_raw \
@@ -267,11 +314,26 @@ case "${PIPELINE_MODE}" in
                 24 \
                 "afterok:${UNMASKED_INFER_JOB_ID}:${MASKED_INFER_JOB_ID}"
         )"
+        SUBMITTED_JOB_IDS+=("${MASKING_SUMMARY_JOB_ID}")
         printf 'DATASET_SUMMARY_JOB_ID=%q\n' "${DATASET_SUMMARY_JOB_ID}" >> "${STATE_FILE}"
         printf 'MASKING_SUMMARY_JOB_ID=%q\n' "${MASKING_SUMMARY_JOB_ID}" >> "${STATE_FILE}"
         ;;
 esac
 
+release_if_set() {
+    local job_id="$1"
+    [[ -z "${job_id}" ]] || scontrol release "${job_id}"
+}
+
+# Release downstream jobs first. They remain blocked by valid dependencies;
+# training is released last, so no compute can begin while the graph is partial.
+release_if_set "${DATASET_SUMMARY_JOB_ID}"
+release_if_set "${MASKING_SUMMARY_JOB_ID}"
+release_if_set "${DATASET_INFER_JOB_ID}"
+release_if_set "${UNMASKED_INFER_JOB_ID}"
+release_if_set "${MASKED_INFER_JOB_ID}"
+scontrol release "${TRAIN_JOB_ID}"
+GRAPH_RELEASED=1
 printf 'PIPELINE_STATUS=scheduled\n' >> "${STATE_FILE}"
 
 printf '\nDeepMS ablation dependency graph scheduled.\n'

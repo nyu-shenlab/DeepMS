@@ -5,7 +5,7 @@ ablation. Run every command from the DeepMS repository root. The shared
 single-run training and inference profiles remain one level above this
 directory and are called by these wrappers.
 
-## Recommended: clone and submit the complete workflow
+## Recommended: checked one-command Shenlab submission
 
 ```bash
 git clone https://github.com/nyu-shenlab/DeepMS.git
@@ -14,17 +14,59 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Start a new shell if `uv` is not immediately available on PATH.
 ./scripts/bootstrap_env.sh
 
+# Refreshes origin and checks the exact scheduler requests without creating jobs.
+./scripts/slurm/ablation/guarded_shenlab_ablation.sh
+
+# Submit the complete graph and wait until all child jobs are recorded in Slurm.
+./scripts/slurm/ablation/guarded_shenlab_ablation.sh --submit
+```
+
+The default command checks the clean Git/upstream state, locked `uv`
+environment, input files, safe worker/GPU/concurrency policy, required bad-node
+exclusions, script syntax, and fresh output roots. It then runs Slurm's
+`sbatch --test-only` against the CPU launcher, training array, inference array,
+and summary request. These scheduler checks create no jobs.
+
+`--submit` creates one lightweight CPU launcher and waits for it to finish
+constructing the existing full graph:
+
+```text
+12-task training array
+  -> task-correlated unmasked and masked inference arrays
+       -> calibrated and masking summaries
+```
+
+Every child job is first submitted in a held state. Only after every job ID and
+dependency is valid are downstream jobs released, followed by training last.
+If graph construction fails, only the held jobs created by that launcher are
+cancelled. `aftercorr` keeps each inference task paired with its training task;
+`afterok` and `--kill-on-invalid-dep=yes` prevent failed upstream work from
+leaving unusable downstream jobs pending.
+
+The launcher generates a timestamp/PID/random run ID. Outputs, state, log job
+names, and every child job are run-specific. The exact clean Git commit is
+rechecked inside every allocation, inherited fixed distributed ports are
+removed, known bad nodes are excluded, and automatic requeue is disabled. The
+state file records the run and every child job ID at:
+
+```text
+outputs/slurm/pipelines/<evaluation-id>/pipeline_jobs.env
+```
+
+## Manual immediate launcher (advanced)
+
+The older direct launcher remains available for deliberate manual operation,
+but it bypasses the Git freshness, scheduler request, and graph receipt checks:
+
+```bash
 sbatch --test-only scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch
 ```
 
-The launcher automatically loads the committed Shenlab profile, uses the shared
-GPFS inputs, resolves the `uv` installed by the current user, derives the
-project root from the current clone, generates a timestamped evaluation ID,
-and submits the complete dependency graph. It does not contain credentials or
-clinical records. The CPU launcher validates the locked environment before
-creating any GPU child jobs; it deliberately does not install packages inside
-Slurm.
+Both launchers load the committed Shenlab profile, use the shared GPFS inputs,
+resolve the `uv` installed by the current user, and derive the project root from
+the current clone. They do not contain credentials or clinical records. Slurm
+jobs validate the locked environment without installing packages.
 
 On another cluster, load a site-local copy of the portable template instead:
 
@@ -62,6 +104,7 @@ keeping all of those worker pools resident can exhaust host memory.
 
 | Script | Role | Resources |
 | --- | --- | --- |
+| `guarded_shenlab_ablation.sh` | Git/environment/scheduler checks; explicit direct graph submission | Login node, then one CPU launcher |
 | `submit_shenlab_ablation.sbatch` | Direct Shenlab profile loading and complete workflow submission | CPU only |
 | `run_diffusion_ablation_pipeline.sbatch` | Preflight and dependency-graph submission | CPU only |
 | `train_diffusion_ablation.sbatch` | 12 map-specific training tasks | 2 GPUs per task |
@@ -87,9 +130,12 @@ concurrent tasks and can be changed with `DEEPMS_ABLATION_CONCURRENCY=1..12`.
 
 `DEEPMS_TRAIN_EXCLUDE_NODES` accepts a comma-separated, site-local list of
 training nodes with known GPU health problems. The Shenlab profile currently
-excludes `a100-4011,a100-4024`; the allocation also probes every visible CUDA
-device before loading data. Do not use `--exclusive` as a substitute for this
-health check: a two-GPU task would otherwise reserve an entire four-GPU node.
+excludes `a100-4011,a100-4024`; every training allocation also probes both
+visible CUDA devices before loading data. The `a100_dev` inference partition
+does not contain those excluded training nodes, and every inference allocation
+runs the same context, compute, synchronization, and PCI-inventory probe on its
+single visible GPU. Do not use `--exclusive` as a substitute for these health
+checks: a two-GPU task would otherwise reserve an entire four-GPU node.
 Application failures are not automatically requeued. After a failed scientific
 run, correct the cause and use a new evaluation ID rather than writing into a
 partially populated output root. Inference also requires the atomic

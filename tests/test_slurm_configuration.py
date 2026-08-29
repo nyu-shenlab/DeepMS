@@ -43,6 +43,9 @@ def test_generic_training_job_does_not_require_legacy_clinical_csvs() -> None:
     assert "DEEPMS_SAVE_INTERVAL" in text
     assert "DEEPMS_VAL_NUM_WORKERS" in text
     assert "scripts/check_cuda_devices.py" in text
+    assert "#SBATCH --no-requeue" in text
+    assert 'ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"' in text
+    assert "JOB_ID + ARRAY_TASK_ID" in text
     assert '--early_stopping_epochs "${EARLY_STOPPING_EPOCHS}"' in text
     assert '--val_interval "${VAL_INTERVAL}"' in text
     assert '--save_interval "${SAVE_INTERVAL}"' in text
@@ -54,6 +57,7 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     text = (REPOSITORY_ROOT / "configs" / "slurm.shenlab.env").read_text(encoding="utf-8")
 
     assert 'export DEEPMS_PROJECT_ROOT="$(pwd -P)"' in text
+    assert 'export DEEPMS_GIT_BIN="${DEEPMS_GIT_BIN:-/gpfs/share/apps/git/2.49.0/bin/git}"' in text
     assert (
         'export DEEPMS_TRAIN_CSV="/gpfs/data/shenlab/Jiajian/MS_Project/code/'
         "ms-diagnosis/meta_data/updated_label_dataset/"
@@ -73,10 +77,7 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     assert "export DEEPMS_SAVE_INTERVAL=5" in text
     assert "export DEEPMS_VAL_NUM_WORKERS=0" in text
     assert "export DEEPMS_EXPECTED_GPUS=2" in text
-    assert (
-        'export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-'
-        'a100-4011,a100-4024}"'
-    ) in text
+    assert ('export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-a100-4011,a100-4024}"') in text
     assert "export DEEPMS_PIPELINE_MODE=both" in text
     assert "export DEEPMS_INCLUDE_B0=1" in text
     assert "export DEEPMS_SAVE_VISUALIZATIONS=0" in text
@@ -186,6 +187,11 @@ def test_one_command_pipeline_is_cpu_only_and_dependency_driven() -> None:
     assert "DEEPMS_ABLATION_OUTPUT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "DEEPMS_ABLATION_CHECKPOINT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "PIPELINE_STATUS=scheduled" in pipeline
+    assert "--hold" in pipeline
+    assert "scancel" in pipeline
+    assert 'scontrol release "${TRAIN_JOB_ID}"' in pipeline
+    assert "GRAPH_RELEASED=1" in pipeline
+    assert "PIPELINE_STATUS=rolled_back" in pipeline
     assert "runtime_environment.sh" in pipeline
 
 
@@ -239,6 +245,7 @@ def test_all_inference_profiles_are_single_gpu_and_have_manifest_preflight() -> 
     for filename, report_profile in profiles.items():
         text = read_slurm(filename)
         assert "#SBATCH --gres=gpu:1" in text
+        assert "#SBATCH --no-requeue" in text
         assert "DEEPMS_PREFLIGHT_ONLY" in text
         assert "--preflight_only" in text
         assert "accelerate launch" not in text
@@ -246,6 +253,20 @@ def test_all_inference_profiles_are_single_gpu_and_have_manifest_preflight() -> 
         assert "DEEPMS_DEFER_PERFORMANCE_REPORT" in text
         assert '"${REPORT_ARGS[@]}"' in text
         assert '--report_bootstrap_samples "${DEEPMS_REPORT_BOOTSTRAPS:-2000}"' in text
+
+
+def test_all_inference_profiles_probe_the_allocated_cuda_device() -> None:
+    for filename in (
+        "infer_internal.sbatch",
+        "infer_krakow.sbatch",
+        "infer_public_external_unmasked.sbatch",
+        "infer_public_external_lesion_masked.sbatch",
+    ):
+        text = read_slurm(filename)
+        assert 'CUDA_PREFLIGHT="${PROJECT_ROOT}/scripts/check_cuda_devices.py"' in text
+        assert '"${UV_RUN[@]}" python "${CUDA_PREFLIGHT}" --expected 1' in text
+        assert "nvidia-smi" in text
+        assert "torch.cuda.device_count()" not in text
 
 
 def test_visualization_is_opt_in_for_every_inference_profile() -> None:
@@ -275,6 +296,7 @@ def test_public_slurm_assets_do_not_embed_site_specific_paths() -> None:
         SLURM_DIR / "infer_public_external_lesion_masked.sbatch",
         REPOSITORY_ROOT / "configs" / "slurm.env.example",
         ABLATION_SLURM_DIR / "run_diffusion_ablation_pipeline.sbatch",
+        ABLATION_SLURM_DIR / "guarded_shenlab_ablation.sh",
         SLURM_DIR / "runtime_environment.sh",
         REPOSITORY_ROOT / "scripts" / "bootstrap_env.sh",
         REPOSITORY_ROOT / "scripts" / "check_environment.py",
