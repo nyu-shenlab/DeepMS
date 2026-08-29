@@ -60,21 +60,29 @@ source "${SITE_PROFILE}"
 
 GIT_BIN="${DEEPMS_GIT_BIN:-git}"
 command -v "${GIT_BIN}" >/dev/null 2>&1 || fail "git is unavailable: ${GIT_BIN}"
+git_command() {
+    if [[ -n "${DEEPMS_GIT_LIB_DIR:-}" ]]; then
+        env LD_LIBRARY_PATH="${DEEPMS_GIT_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+            "${GIT_BIN}" "$@"
+    else
+        "${GIT_BIN}" "$@"
+    fi
+}
 
-GIT_COMMIT="$("${GIT_BIN}" -C "${PROJECT_ROOT}" rev-parse --verify HEAD)" || \
+GIT_COMMIT="$(git_command -C "${PROJECT_ROOT}" rev-parse --verify HEAD)" || \
     fail "Could not resolve the current Git commit."
 [[ "${GIT_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || fail "Unexpected Git commit: ${GIT_COMMIT}"
-GIT_STATUS="$("${GIT_BIN}" -C "${PROJECT_ROOT}" status --porcelain --untracked-files=normal)" || \
+GIT_STATUS="$(git_command -C "${PROJECT_ROOT}" status --porcelain --untracked-files=normal)" || \
     fail "Could not inspect the Git worktree."
 [[ -z "${GIT_STATUS}" ]] || fail "The Git worktree is not clean. Commit or discard local changes first."
-GIT_UPSTREAM="$("${GIT_BIN}" -C "${PROJECT_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" || \
+GIT_UPSTREAM="$(git_command -C "${PROJECT_ROOT}" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" || \
     fail "The current branch has no upstream."
 UPSTREAM_REMOTE="${GIT_UPSTREAM%%/*}"
 [[ -n "${UPSTREAM_REMOTE}" && "${UPSTREAM_REMOTE}" != "${GIT_UPSTREAM}" ]] || \
     fail "Could not identify the upstream remote from ${GIT_UPSTREAM}."
-"${GIT_BIN}" -C "${PROJECT_ROOT}" fetch --quiet "${UPSTREAM_REMOTE}" || \
+git_command -C "${PROJECT_ROOT}" fetch --quiet "${UPSTREAM_REMOTE}" || \
     fail "Could not refresh ${UPSTREAM_REMOTE}. Check network access, then retry."
-UPSTREAM_COMMIT="$("${GIT_BIN}" -C "${PROJECT_ROOT}" rev-parse --verify "${GIT_UPSTREAM}")" || \
+UPSTREAM_COMMIT="$(git_command -C "${PROJECT_ROOT}" rev-parse --verify "${GIT_UPSTREAM}")" || \
     fail "Could not resolve ${GIT_UPSTREAM}."
 [[ "${GIT_COMMIT}" == "${UPSTREAM_COMMIT}" ]] || \
     fail "This checkout is not current (${GIT_COMMIT} != ${GIT_UPSTREAM} ${UPSTREAM_COMMIT}). Run git pull --ff-only."

@@ -58,6 +58,7 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
 
     assert 'export DEEPMS_PROJECT_ROOT="$(pwd -P)"' in text
     assert 'export DEEPMS_GIT_BIN="${DEEPMS_GIT_BIN:-/gpfs/share/apps/git/2.49.0/bin/git}"' in text
+    assert 'export DEEPMS_GIT_LIB_DIR="${DEEPMS_GIT_LIB_DIR:-/gpfs/share/apps/git/2.49.0/lib64}"' in text
     assert (
         'export DEEPMS_TRAIN_CSV="/gpfs/data/shenlab/Jiajian/MS_Project/code/'
         "ms-diagnosis/meta_data/updated_label_dataset/"
