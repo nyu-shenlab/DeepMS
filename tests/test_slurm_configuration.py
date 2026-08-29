@@ -41,9 +41,13 @@ def test_generic_training_job_does_not_require_legacy_clinical_csvs() -> None:
     assert "DEEPMS_EARLY_STOPPING_EPOCHS" in text
     assert "DEEPMS_VAL_INTERVAL" in text
     assert "DEEPMS_SAVE_INTERVAL" in text
+    assert "DEEPMS_VAL_NUM_WORKERS" in text
+    assert "scripts/check_cuda_devices.py" in text
     assert '--early_stopping_epochs "${EARLY_STOPPING_EPOCHS}"' in text
     assert '--val_interval "${VAL_INTERVAL}"' in text
     assert '--save_interval "${SAVE_INTERVAL}"' in text
+    assert '--val_num_workers "${VAL_NUM_WORKERS}"' in text
+    assert "#SBATCH --exclusive" not in text
 
 
 def test_shenlab_site_profile_is_copy_ready() -> None:
@@ -67,6 +71,12 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     assert "export DEEPMS_EARLY_STOPPING_EPOCHS=5" in text
     assert "export DEEPMS_VAL_INTERVAL=1" in text
     assert "export DEEPMS_SAVE_INTERVAL=5" in text
+    assert "export DEEPMS_VAL_NUM_WORKERS=0" in text
+    assert "export DEEPMS_EXPECTED_GPUS=2" in text
+    assert (
+        'export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-'
+        'a100-4011,a100-4024}"'
+    ) in text
     assert "export DEEPMS_PIPELINE_MODE=both" in text
     assert "export DEEPMS_INCLUDE_B0=1" in text
     assert "export DEEPMS_SAVE_VISUALIZATIONS=0" in text
@@ -95,6 +105,7 @@ def test_shenlab_direct_submit_job_loads_the_committed_profile() -> None:
 def test_diffusion_ablation_order_and_single_map_contract() -> None:
     text = read_slurm("ablation/train_diffusion_ablation.sbatch")
     assert "#SBATCH --array=0-11%4" in text
+    assert "#SBATCH --exclusive" not in text
     assert extract_array(text, "DIFFUSION_MAPS") == [
         "Da_smi",
         "DePar_smi",
@@ -137,7 +148,9 @@ def test_diffusion_ablation_inference_and_final_summary_contract() -> None:
     assert extract_array(inference, "DIFFUSION_MAPS") == extract_array(training, "DIFFUSION_MAPS")
     assert extract_array(inference, "DIFFUSION_FAMILIES") == extract_array(training, "DIFFUSION_FAMILIES")
     assert "find " in inference
-    assert "-name best_model.pth" in inference
+    assert "-name training_complete.json" in inference
+    assert 'CHECKPOINT="${COMPLETED_ATTEMPT_ROOT}/best_model.pth"' in inference
+    assert "Expected exactly one completed training attempt" in inference
     assert "DEEPMS_DEFER_PERFORMANCE_REPORT=1" in inference
     assert "DEEPMS_ABLATION_INFER_PROFILE" in inference
 
@@ -166,8 +179,10 @@ def test_one_command_pipeline_is_cpu_only_and_dependency_driven() -> None:
     assert "dataset_calibrated|masking_raw|both" in pipeline
     assert "DEEPMS_ABLATION_CONCURRENCY:-4" in pipeline
     assert 'ARRAY_SPEC="0-11%${CONCURRENCY}"' in pipeline
-    assert '--dependency="afterok:${training_job_id}"' in pipeline
+    assert '--dependency="aftercorr:${training_job_id}"' in pipeline
     assert '"afterok:${UNMASKED_INFER_JOB_ID}:${MASKED_INFER_JOB_ID}"' in pipeline
+    assert "DEEPMS_TRAIN_EXCLUDE_NODES" in pipeline
+    assert "--kill-on-invalid-dep=yes" in pipeline
     assert "DEEPMS_ABLATION_OUTPUT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "DEEPMS_ABLATION_CHECKPOINT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "PIPELINE_STATUS=scheduled" in pipeline
@@ -263,6 +278,7 @@ def test_public_slurm_assets_do_not_embed_site_specific_paths() -> None:
         SLURM_DIR / "runtime_environment.sh",
         REPOSITORY_ROOT / "scripts" / "bootstrap_env.sh",
         REPOSITORY_ROOT / "scripts" / "check_environment.py",
+        REPOSITORY_ROOT / "scripts" / "check_cuda_devices.py",
     ]
     for path in public_assets:
         assert "/gpfs/" not in path.read_text(encoding="utf-8"), path

@@ -47,12 +47,17 @@ MAP_CHECKPOINT_ROOT="${CHECKPOINT_ROOT}/${DIFFUSION_FAMILY}/${DIFFUSION_MAP}"
 [[ -d "${MAP_CHECKPOINT_ROOT}" ]] || \
     fail "Checkpoint directory not found: ${MAP_CHECKPOINT_ROOT}"
 
-mapfile -d '' -t CHECKPOINTS < <(
-    find "${MAP_CHECKPOINT_ROOT}" -type f -name best_model.pth -print0
+mapfile -d '' -t COMPLETION_MANIFESTS < <(
+    find "${MAP_CHECKPOINT_ROOT}" -type f -name training_complete.json -print0
 )
-if (( ${#CHECKPOINTS[@]} != 1 )); then
-    fail "Expected exactly one best_model.pth under ${MAP_CHECKPOINT_ROOT}; found ${#CHECKPOINTS[@]}."
+if (( ${#COMPLETION_MANIFESTS[@]} != 1 )); then
+    fail "Expected exactly one completed training attempt under ${MAP_CHECKPOINT_ROOT}; found ${#COMPLETION_MANIFESTS[@]} completion manifests."
 fi
+COMPLETION_MANIFEST="${COMPLETION_MANIFESTS[0]}"
+COMPLETED_ATTEMPT_ROOT="$(dirname "${COMPLETION_MANIFEST}")"
+CHECKPOINT="${COMPLETED_ATTEMPT_ROOT}/best_model.pth"
+[[ -f "${CHECKPOINT}" ]] || \
+    fail "Completed training attempt has no best_model.pth: ${COMPLETED_ATTEMPT_ROOT}"
 
 PROFILE="${DEEPMS_ABLATION_INFER_PROFILE:-public_external_unmasked}"
 case "${PROFILE}" in
@@ -77,7 +82,7 @@ EVALUATION_ID="${DEEPMS_ABLATION_EVAL_ID:-job-${SLURM_ARRAY_JOB_ID:-manual}}"
 INFERENCE_ROOT="${DEEPMS_ABLATION_INFERENCE_ROOT:-${PROJECT_ROOT}/outputs/inference/diffusion_single_map}"
 RUNS_ROOT="${INFERENCE_ROOT}/${EVALUATION_ID}/${PROFILE}"
 
-export DEEPMS_MODEL_PATH="${CHECKPOINTS[0]}"
+export DEEPMS_MODEL_PATH="${CHECKPOINT}"
 export DEEPMS_INFERENCE_OUTPUT_DIR="${RUNS_ROOT}/${DIFFUSION_FAMILY}/${DIFFUSION_MAP}"
 export DEEPMS_DEFER_PERFORMANCE_REPORT=1
 
@@ -90,6 +95,7 @@ printf '  family:     %s\n' "${DIFFUSION_FAMILY}"
 printf '  map:        %s\n' "${DIFFUSION_MAP}"
 printf '  profile:    %s\n' "${PROFILE}"
 printf '  checkpoint: %s\n' "${DEEPMS_MODEL_PATH}"
+printf '  completion: %s\n' "${COMPLETION_MANIFEST}"
 printf '  output:     %s\n' "${DEEPMS_INFERENCE_OUTPUT_DIR}"
 printf '  final root: %s\n' "${RUNS_ROOT}"
 

@@ -53,6 +53,11 @@ training wrapper. Set `DEEPMS_INCLUDE_B0=0` only for a deliberately strict
 T1/FLAIR-only baseline. Keep `.env`, clinical manifests, checkpoints, and
 outputs outside Git.
 
+Training and validation worker pools are configured separately. Training keeps
+its workers persistent for throughput, while validation defaults to
+`DEEPMS_VAL_NUM_WORKERS=0`; one validation loader exists per modality, so
+keeping all of those worker pools resident can exhaust host memory.
+
 ## Jobs
 
 | Script | Role | Resources |
@@ -74,9 +79,22 @@ The default `both` graph is:
 ```
 
 The orchestration job exits after scheduling its children; it does not hold a
-GPU while waiting. All downstream jobs use `afterok`. The default array cap is
-four concurrent tasks and can be changed with
-`DEEPMS_ABLATION_CONCURRENCY=1..12`.
+GPU while waiting. Each inference array uses `aftercorr` so an element starts
+only after the matching training element succeeds. Summary jobs still use
+`afterok` and require every expected result. Invalid dependencies are cancelled
+instead of remaining pending indefinitely. The default array cap is four
+concurrent tasks and can be changed with `DEEPMS_ABLATION_CONCURRENCY=1..12`.
+
+`DEEPMS_TRAIN_EXCLUDE_NODES` accepts a comma-separated, site-local list of
+training nodes with known GPU health problems. The Shenlab profile currently
+excludes `a100-4011,a100-4024`; the allocation also probes every visible CUDA
+device before loading data. Do not use `--exclusive` as a substitute for this
+health check: a two-GPU task would otherwise reserve an entire four-GPU node.
+Application failures are not automatically requeued. After a failed scientific
+run, correct the cause and use a new evaluation ID rather than writing into a
+partially populated output root. Inference also requires the atomic
+`training_complete.json` written at a successful training exit; a checkpoint
+left behind by an interrupted or OOM-killed run is not accepted.
 
 ## Monitoring and completion
 

@@ -98,6 +98,11 @@ CONCURRENCY="${DEEPMS_ABLATION_CONCURRENCY:-4}"
 (( CONCURRENCY <= 12 )) || \
     fail "DEEPMS_ABLATION_CONCURRENCY cannot exceed 12."
 ARRAY_SPEC="0-11%${CONCURRENCY}"
+TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-}"
+if [[ -n "${TRAIN_EXCLUDE_NODES}" ]]; then
+    [[ "${TRAIN_EXCLUDE_NODES}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] || \
+        fail "DEEPMS_TRAIN_EXCLUDE_NODES must be a comma-separated node list."
+fi
 
 TRAIN_ROOT="${DEEPMS_PIPELINE_TRAIN_ROOT:-${PROJECT_ROOT}/outputs/train/diffusion_single_map/${EVALUATION_ID}}"
 INFERENCE_ROOT="${DEEPMS_ABLATION_INFERENCE_ROOT:-${PROJECT_ROOT}/outputs/inference/diffusion_single_map}"
@@ -126,6 +131,7 @@ STATE_FILE="${STATE_DIR}/pipeline_jobs.env"
     printf 'TRAIN_ROOT=%q\n' "${TRAIN_ROOT}"
     printf 'EVALUATION_ROOT=%q\n' "${EVALUATION_ROOT}"
     printf 'ARRAY_SPEC=%q\n' "${ARRAY_SPEC}"
+    printf 'TRAIN_EXCLUDE_NODES=%q\n' "${TRAIN_EXCLUDE_NODES}"
 } > "${STATE_FILE}"
 
 parse_job_id() {
@@ -139,15 +145,20 @@ parse_job_id() {
 submit_training() {
     local export_spec
     local response
+    local -a submit_args
     export_spec="ALL,DEEPMS_PROJECT_ROOT=${PROJECT_ROOT}"
     export_spec+=",DEEPMS_ABLATION_OUTPUT_ROOT=${TRAIN_ROOT}"
     export_spec+=",DEEPMS_PREFLIGHT_ONLY=0"
+    submit_args=(
+        --parsable
+        --array="${ARRAY_SPEC}"
+        --export="${export_spec}"
+    )
+    if [[ -n "${TRAIN_EXCLUDE_NODES}" ]]; then
+        submit_args+=(--exclude="${TRAIN_EXCLUDE_NODES}")
+    fi
     response="$(
-        sbatch \
-            --parsable \
-            --array="${ARRAY_SPEC}" \
-            --export="${export_spec}" \
-            "${TRAIN_JOB}"
+        sbatch "${submit_args[@]}" "${TRAIN_JOB}"
     )"
     parse_job_id "${response}"
 }
@@ -167,7 +178,8 @@ submit_inference() {
         sbatch \
             --parsable \
             --array="${ARRAY_SPEC}" \
-            --dependency="afterok:${training_job_id}" \
+            --dependency="aftercorr:${training_job_id}" \
+            --kill-on-invalid-dep=yes \
             --export="${export_spec}" \
             "${INFER_JOB}"
     )"
@@ -192,6 +204,7 @@ submit_summary() {
         sbatch \
             --parsable \
             --dependency="${dependency}" \
+            --kill-on-invalid-dep=yes \
             --export="${export_spec}" \
             "${SUMMARY_JOB}"
     )"

@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import logging
 import os
 import random
@@ -120,6 +121,40 @@ def save_checkpoint(
     )
 
 
+def write_training_completion(
+    output_path: str,
+    *,
+    last_epoch: int,
+    best_metric: float,
+    best_metric_epoch: int,
+    completed_updates: int,
+    selection_metric: str,
+) -> str:
+    """Atomically mark a run complete only after its final artifacts exist."""
+    best_model_path = os.path.join(output_path, "best_model.pth")
+    if not os.path.isfile(best_model_path):
+        raise RuntimeError("Training completed without producing best_model.pth.")
+
+    completion_path = os.path.join(output_path, "training_complete.json")
+    temporary_path = f"{completion_path}.tmp-{os.getpid()}"
+    payload = {
+        "schema_version": 1,
+        "status": "complete",
+        "last_epoch": last_epoch,
+        "best_metric": best_metric,
+        "best_metric_epoch": best_metric_epoch,
+        "completed_updates": completed_updates,
+        "selection_metric": selection_metric,
+        "best_model": "best_model.pth",
+        "final_model": "final_model.pth",
+    }
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary_path, completion_path)
+    return completion_path
+
+
 # ---------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------
@@ -178,6 +213,15 @@ def get_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument(
+        "--val_num_workers",
+        type=int,
+        default=0,
+        help=(
+            "Worker processes per validation loader. Validation workers are never "
+            "persistent because one loader is created per modality."
+        ),
+    )
 
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=5)
@@ -513,6 +557,25 @@ def prepare_datasets(args, logger, accelerator):
 # ---------------------------------------------------------------------
 # Dataloaders
 # ---------------------------------------------------------------------
+def _worker_loader_kwargs(
+    num_workers: int,
+    *,
+    persistent: bool,
+    prefetch_factor: int,
+) -> Dict[str, Any]:
+    """Build bounded worker settings without invalid zero-worker options."""
+    if num_workers < 0:
+        raise ValueError("DataLoader worker counts must be non-negative.")
+
+    worker_kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "persistent_workers": persistent and num_workers > 0,
+    }
+    if num_workers > 0:
+        worker_kwargs["prefetch_factor"] = prefetch_factor
+    return worker_kwargs
+
+
 def create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerator):
     """Build loaders once; Accelerate performs the only rank-level sharding."""
     world_size = accelerator.num_processes
@@ -534,10 +597,8 @@ def create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerat
             generator=generator,
         )
 
-    loader_kwargs = {
-        "num_workers": args.num_workers,
+    common_loader_kwargs = {
         "pin_memory": torch.cuda.is_available(),
-        "persistent_workers": args.num_workers > 0,
         "collate_fn": collate_skip_none,
     }
     train_loader = DataLoader(
@@ -546,7 +607,13 @@ def create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerat
         shuffle=(sampler is None),
         sampler=sampler,
         drop_last=True,
-        **loader_kwargs,
+        **common_loader_kwargs,
+        **_worker_loader_kwargs(
+            args.num_workers,
+            persistent=True,
+            # Preserve PyTorch's previous training-loader default.
+            prefetch_factor=2,
+        ),
     )
 
     val_dataloaders = {
@@ -555,7 +622,13 @@ def create_dataloaders(train_ds, val_datasets, sampling_weights, args, accelerat
             batch_size=args.val_batch_size,
             shuffle=False,
             drop_last=False,
-            **loader_kwargs,
+            **common_loader_kwargs,
+            **_worker_loader_kwargs(
+                args.val_num_workers,
+                persistent=False,
+                # Bound the large multi-mask validation batches when workers are enabled.
+                prefetch_factor=1,
+            ),
         )
         for modality, val_ds in val_datasets.items()
     }
@@ -1009,6 +1082,15 @@ def main(args):
         logger.info("Mixed precision: %s", args.mixed_precision)
         logger.info("Gradient accumulation steps: %s", args.gradient_accumulation_steps)
         logger.info("Number of processes: %s", accelerator.num_processes)
+        logger.info(
+            "DataLoader workers: train=%d (persistent=%s, prefetch=%s), "
+            "validation=%d (persistent=False, prefetch=%s)",
+            args.num_workers,
+            args.num_workers > 0,
+            2 if args.num_workers > 0 else "disabled",
+            args.val_num_workers,
+            1 if args.val_num_workers > 0 else "disabled",
+        )
         logger.info("Number of epochs: %s", args.num_epochs)
         logger.info("Checkpoint-selection metric: %s", args.auc_metric)
 
@@ -1338,6 +1420,15 @@ def main(args):
             accelerator.unwrap_model(model).state_dict(),
             os.path.join(output_path, "final_model.pth"),
         )
+        completion_path = write_training_completion(
+            output_path,
+            last_epoch=epoch,
+            best_metric=best_metric,
+            best_metric_epoch=best_metric_epoch,
+            completed_updates=lr_scheduler.completed_steps,
+            selection_metric=args.auc_metric,
+        )
+        logger.info("Wrote training completion manifest: %s", completion_path)
         if writer is not None:
             writer.close()
         if WANDB_AVAILABLE and args.use_wandb:

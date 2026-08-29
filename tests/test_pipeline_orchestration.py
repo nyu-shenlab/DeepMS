@@ -65,6 +65,7 @@ printf '%s;test-cluster\n' "${job_id}"
             "DEEPMS_ABLATION_INFER_PROFILE": profile,
             "DEEPMS_ABLATION_EVAL_ID": evaluation_id,
             "DEEPMS_ABLATION_CONCURRENCY": "3",
+            "DEEPMS_TRAIN_EXCLUDE_NODES": "node-bad-1,node-bad-2",
             "DEEPMS_PIPELINE_TRAIN_ROOT": str(tmp_path / "train" / evaluation_id),
             "DEEPMS_ABLATION_INFERENCE_ROOT": str(tmp_path / "inference"),
             "DEEPMS_PIPELINE_STATE_ROOT": str(state_root),
@@ -116,11 +117,14 @@ def test_dataset_pipeline_submits_train_infer_summary_dependency_chain(
     assert len(commands) == 3
     training, inference, summary = commands
     assert "--array=0-11%3" in training
+    assert "--exclude=node-bad-1,node-bad-2" in training
     assert training[-1].endswith("train_diffusion_ablation.sbatch")
-    assert "--dependency=afterok:1001" in inference
+    assert "--dependency=aftercorr:1001" in inference
+    assert "--kill-on-invalid-dep=yes" in inference
     assert "DEEPMS_ABLATION_INFER_PROFILE=krakow" in _export_argument(inference)
     assert inference[-1].endswith("infer_diffusion_ablation.sbatch")
     assert "--dependency=afterok:1002" in summary
+    assert "--kill-on-invalid-dep=yes" in summary
     summary_export = _export_argument(summary)
     assert "DEEPMS_EVALUATION_MODE=dataset_calibrated" in summary_export
     assert "DEEPMS_EXPECTED_INFERENCE_RUNS=12" in summary_export
@@ -129,6 +133,7 @@ def test_dataset_pipeline_submits_train_infer_summary_dependency_chain(
 
     state = state_file.read_text(encoding="utf-8")
     assert "PIPELINE_STATUS=scheduled" in state
+    assert r"TRAIN_EXCLUDE_NODES=node-bad-1\,node-bad-2" in state
     assert "TRAIN_JOB_ID=1001" in state
     assert "DATASET_INFER_JOB_ID=1002" in state
     assert "DATASET_SUMMARY_JOB_ID=1003" in state
@@ -143,14 +148,18 @@ def test_both_pipeline_reuses_unmasked_inference_and_schedules_two_summaries(
     assert len(commands) == 5
     training, unmasked, masked, dataset_summary, masking_summary = commands
     assert training[-1].endswith("train_diffusion_ablation.sbatch")
-    assert "--dependency=afterok:1001" in unmasked
-    assert "--dependency=afterok:1001" in masked
+    assert "--dependency=aftercorr:1001" in unmasked
+    assert "--dependency=aftercorr:1001" in masked
+    assert "--kill-on-invalid-dep=yes" in unmasked
+    assert "--kill-on-invalid-dep=yes" in masked
     assert "DEEPMS_ABLATION_INFER_PROFILE=public_external_unmasked" in _export_argument(unmasked)
     assert "DEEPMS_ABLATION_INFER_PROFILE=public_external_masked" in _export_argument(masked)
 
     assert "--dependency=afterok:1002" in dataset_summary
+    assert "--kill-on-invalid-dep=yes" in dataset_summary
     assert "DEEPMS_EVALUATION_MODE=dataset_calibrated" in _export_argument(dataset_summary)
     assert "--dependency=afterok:1002:1003" in masking_summary
+    assert "--kill-on-invalid-dep=yes" in masking_summary
     masking_export = _export_argument(masking_summary)
     assert "DEEPMS_EVALUATION_MODE=masking_raw" in masking_export
     assert "DEEPMS_EXPECTED_INFERENCE_RUNS=24" in masking_export
@@ -183,6 +192,7 @@ def test_shenlab_launcher_loads_a_site_profile_and_submits_the_full_graph(
         "DEEPMS_ABLATION_INFER_PROFILE",
         "DEEPMS_ABLATION_EVAL_ID",
         "DEEPMS_ABLATION_CONCURRENCY",
+        "DEEPMS_TRAIN_EXCLUDE_NODES",
         "DEEPMS_PIPELINE_TRAIN_ROOT",
         "DEEPMS_ABLATION_INFERENCE_ROOT",
         "DEEPMS_PIPELINE_STATE_ROOT",
@@ -247,3 +257,49 @@ def test_incomplete_environment_submits_no_child_jobs(tmp_path: Path) -> None:
     assert "locked environment is incomplete" in completed.stderr
     assert not command_log.exists() or not command_log.read_text(encoding="utf-8").strip()
     assert not state_file.exists()
+
+
+def test_invalid_training_exclude_list_submits_no_child_jobs(tmp_path: Path) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(
+        tmp_path,
+        mode="both",
+    )
+    environment["DEEPMS_TRAIN_EXCLUDE_NODES"] = "node-bad-1 node-bad-2"
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "comma-separated node list" in completed.stderr
+    assert not command_log.exists() or not command_log.read_text(encoding="utf-8").strip()
+    assert not state_file.exists()
+
+
+def test_empty_training_exclude_list_adds_no_sbatch_exclusion(tmp_path: Path) -> None:
+    environment, command_log, _ = _fake_pipeline_environment(
+        tmp_path,
+        mode="dataset_calibrated",
+    )
+    environment.pop("DEEPMS_TRAIN_EXCLUDE_NODES")
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    commands = [
+        shlex.split(line)
+        for line in command_log.read_text(encoding="utf-8").splitlines()
+    ]
+    assert not any(argument.startswith("--exclude=") for argument in commands[0])

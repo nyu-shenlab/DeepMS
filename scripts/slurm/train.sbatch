@@ -50,6 +50,8 @@ SAVE_INTERVAL="${DEEPMS_SAVE_INTERVAL:-5}"
 BATCH_SIZE="${DEEPMS_BATCH_SIZE:-16}"
 VAL_BATCH_SIZE="${DEEPMS_VAL_BATCH_SIZE:-16}"
 NUM_WORKERS="${DEEPMS_NUM_WORKERS:-4}"
+VAL_NUM_WORKERS="${DEEPMS_VAL_NUM_WORKERS:-0}"
+EXPECTED_GPUS="${DEEPMS_EXPECTED_GPUS:-2}"
 LEARNING_RATE="${DEEPMS_LEARNING_RATE:-1e-4}"
 MIN_LR="${DEEPMS_MIN_LR:-1e-6}"
 WARMUP_START_LR="${DEEPMS_WARMUP_START_LR:-1e-6}"
@@ -71,6 +73,12 @@ case "${AUC_METRIC}" in
 esac
 [[ "${GRADIENT_ACCUMULATION_STEPS}" =~ ^[1-9][0-9]*$ ]] || \
     fail "DEEPMS_GRADIENT_ACCUMULATION_STEPS must be a positive integer."
+[[ "${NUM_WORKERS}" =~ ^[0-9]+$ ]] || \
+    fail "DEEPMS_NUM_WORKERS must be a non-negative integer."
+[[ "${VAL_NUM_WORKERS}" =~ ^[0-9]+$ ]] || \
+    fail "DEEPMS_VAL_NUM_WORKERS must be a non-negative integer."
+[[ "${EXPECTED_GPUS}" =~ ^[1-9][0-9]*$ ]] || \
+    fail "DEEPMS_EXPECTED_GPUS must be a positive integer."
 for name in NUM_EPOCHS EARLY_STOPPING_EPOCHS VAL_INTERVAL SAVE_INTERVAL; do
     [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || \
         fail "${name} must be a positive integer."
@@ -142,6 +150,8 @@ printf 'Slurm job: %s | master port: %s\n' "${SLURM_JOB_ID:-local}" "${MASTER_PO
 printf 'Training modalities: %s\n' "${TRAIN_MODALITIES[*]}"
 printf 'Training control: epochs=%s | validation interval=%s | early-stop patience=%s | checkpoint interval=%s\n' \
     "${NUM_EPOCHS}" "${VAL_INTERVAL}" "${EARLY_STOPPING_EPOCHS}" "${SAVE_INTERVAL}"
+printf 'DataLoader workers: train=%s | validation=%s\n' \
+    "${NUM_WORKERS}" "${VAL_NUM_WORKERS}"
 printf 'Validation modalities: %s\n' "${VALIDATION_MODALITIES[*]}"
 case "${DEEPMS_PREFLIGHT_ONLY:-0}" in
     1)
@@ -152,11 +162,12 @@ case "${DEEPMS_PREFLIGHT_ONLY:-0}" in
     0) ;;
     *) fail "DEEPMS_PREFLIGHT_ONLY must be 0 or 1." ;;
 esac
-"${UV_RUN[@]}" python -c \
-    'import torch; print(f"torch={torch.__version__} cuda={torch.version.cuda} gpus={torch.cuda.device_count()}")'
+CUDA_PREFLIGHT="${PROJECT_ROOT}/scripts/check_cuda_devices.py"
+[[ -f "${CUDA_PREFLIGHT}" ]] || fail "CUDA preflight helper not found: ${CUDA_PREFLIGHT}"
 if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi
 fi
+"${UV_RUN[@]}" python "${CUDA_PREFLIGHT}" --expected "${EXPECTED_GPUS}"
 
 srun "${UV_RUN[@]}" accelerate launch \
     --config_file "${PROJECT_ROOT}/configs/accelerate/multi_gpu.yaml" \
@@ -176,6 +187,7 @@ srun "${UV_RUN[@]}" accelerate launch \
     --val_interval "${VAL_INTERVAL}" \
     --save_interval "${SAVE_INTERVAL}" \
     --num_workers "${NUM_WORKERS}" \
+    --val_num_workers "${VAL_NUM_WORKERS}" \
     --lr "${LEARNING_RATE}" \
     --roi_x 128 --roi_y 128 --roi_z 128 \
     --use_global_transform \
