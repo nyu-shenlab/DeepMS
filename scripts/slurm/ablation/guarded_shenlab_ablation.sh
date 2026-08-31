@@ -102,6 +102,8 @@ done
     fail "DEEPMS_VAL_NUM_WORKERS must be 0 to avoid validation-worker host-memory spikes."
 [[ "${DEEPMS_EXPECTED_GPUS:-}" == "2" ]] || \
     fail "DEEPMS_EXPECTED_GPUS must be 2."
+[[ "${DEEPMS_INFERENCE_BATCH_SIZE:-}" == "8" ]] || \
+    fail "DEEPMS_INFERENCE_BATCH_SIZE must be 8 for the Shenlab single-GPU inference workflow."
 CONCURRENCY="${DEEPMS_ABLATION_CONCURRENCY:-}"
 [[ "${CONCURRENCY}" =~ ^[1-9][0-9]*$ ]] || \
     fail "DEEPMS_ABLATION_CONCURRENCY must be a positive integer."
@@ -118,6 +120,14 @@ for required_node in a100-4011 a100-4012 a100-4024 a100-4033; do
         *) fail "The Shenlab exclusion list must include ${required_node}." ;;
     esac
 done
+
+INFER_EXCLUDE_NODES="${DEEPMS_INFER_EXCLUDE_NODES:-}"
+[[ "${INFER_EXCLUDE_NODES}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] || \
+    fail "DEEPMS_INFER_EXCLUDE_NODES must be a comma-separated node list."
+case ",${INFER_EXCLUDE_NODES}," in
+    *",a100-4004,"*) ;;
+    *) fail "The Shenlab inference exclusion list must include a100-4004." ;;
+esac
 
 # Never propagate a user-fixed distributed port into independently scheduled
 # array elements. train.sbatch derives a distinct port from each Slurm task.
@@ -202,6 +212,7 @@ slurm_test training-array \
     "${TRAIN_JOB}"
 slurm_test inference-array \
     --array="0-11%${CONCURRENCY}" \
+    --exclude="${INFER_EXCLUDE_NODES}" \
     --job-name="deepms-infer-${RUN_TAG}" \
     "${INFER_JOB}"
 slurm_test summaries \

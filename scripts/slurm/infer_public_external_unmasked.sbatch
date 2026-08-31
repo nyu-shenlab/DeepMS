@@ -41,7 +41,11 @@ deepms_activate_locked_environment "${PROJECT_ROOT}"
 OUTPUT_DIR="${DEEPMS_INFERENCE_OUTPUT_DIR:-${PROJECT_ROOT}/outputs/inference/public-external-unmasked/job-${SLURM_JOB_ID:-manual}}"
 VISUALIZATION_DIR="${DEEPMS_VISUALIZATION_DIR:-${PROJECT_ROOT}/visualizations/public-external-unmasked/job-${SLURM_JOB_ID:-manual}}"
 NUM_WORKERS="${DEEPMS_NUM_WORKERS:-4}"
+BATCH_SIZE="${DEEPMS_INFERENCE_BATCH_SIZE:-8}"
 MIXED_PRECISION="${DEEPMS_MIXED_PRECISION:-fp16}"
+
+[[ "${BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+    fail "DEEPMS_INFERENCE_BATCH_SIZE must be a positive integer."
 
 case "${MIXED_PRECISION}" in
     no|fp16|bf16) ;;
@@ -82,7 +86,7 @@ INFER_COMMAND=(
     --use_preprocess
     --direct_resize
     --use_global_transform
-    --batch_size "${DEEPMS_BATCH_SIZE:-8}"
+    --batch_size "${BATCH_SIZE}"
     --num_workers "${NUM_WORKERS}"
     --num_channels 1
     --resize_size 128
@@ -103,6 +107,7 @@ printf 'Inference profile: Public External / unmasked\n'
 printf 'Image policy: preprocessing\n'
 printf 'Modalities: %s\n' "${MODALITIES[*]}"
 printf 'Test CSV: %s\n' "${DEEPMS_PUBLIC_EXTERNAL_TEST_CSV}"
+printf 'Batch size: %s\n' "${BATCH_SIZE}"
 printf 'Output: %s\n' "${OUTPUT_DIR}"
 
 case "${DEEPMS_PREFLIGHT_ONLY:-0}" in

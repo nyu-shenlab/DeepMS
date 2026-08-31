@@ -79,10 +79,12 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     assert "export DEEPMS_SAVE_INTERVAL=5" in text
     assert "export DEEPMS_VAL_NUM_WORKERS=0" in text
     assert "export DEEPMS_EXPECTED_GPUS=2" in text
+    assert 'export DEEPMS_INFERENCE_BATCH_SIZE="${DEEPMS_INFERENCE_BATCH_SIZE:-8}"' in text
     assert (
         'export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-'
         'a100-4011,a100-4012,a100-4024,a100-4033}"'
     ) in text
+    assert 'export DEEPMS_INFER_EXCLUDE_NODES="${DEEPMS_INFER_EXCLUDE_NODES:-a100-4004}"' in text
     assert "export DEEPMS_PIPELINE_MODE=both" in text
     assert "export DEEPMS_INCLUDE_B0=1" in text
     assert "export DEEPMS_SAVE_VISUALIZATIONS=0" in text
@@ -208,6 +210,8 @@ def test_one_command_pipeline_is_cpu_only_and_dependency_driven() -> None:
     assert '--dependency="aftercorr:${training_job_id}"' in pipeline
     assert '"afterok:${UNMASKED_INFER_JOB_ID}:${MASKED_INFER_JOB_ID}"' in pipeline
     assert "DEEPMS_TRAIN_EXCLUDE_NODES" in pipeline
+    assert "DEEPMS_INFER_EXCLUDE_NODES" in pipeline
+    assert "DEEPMS_INFERENCE_BATCH_SIZE" in pipeline
     assert "--kill-on-invalid-dep=yes" in pipeline
     assert "DEEPMS_ABLATION_OUTPUT_ROOT=${TRAIN_ROOT}" in pipeline
     assert "DEEPMS_ABLATION_CHECKPOINT_ROOT=${TRAIN_ROOT}" in pipeline
@@ -273,6 +277,9 @@ def test_all_inference_profiles_are_single_gpu_and_have_manifest_preflight() -> 
         assert "#SBATCH --no-requeue" in text
         assert "DEEPMS_PREFLIGHT_ONLY" in text
         assert "--preflight_only" in text
+        assert 'BATCH_SIZE="${DEEPMS_INFERENCE_BATCH_SIZE:-8}"' in text
+        assert '--batch_size "${BATCH_SIZE}"' in text
+        assert "DEEPMS_BATCH_SIZE" not in text
         assert "accelerate launch" not in text
         assert f"--report_profile {report_profile}" in text
         assert "DEEPMS_DEFER_PERFORMANCE_REPORT" in text

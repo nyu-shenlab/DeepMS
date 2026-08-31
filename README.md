@@ -457,7 +457,7 @@ NIfTI visualizations default to off for every inference profile. Set
 otherwise non-binary rows are excluded and counted.
 
 All profiles accept `DEEPMS_PROJECT_ROOT`, `DEEPMS_UV_BIN`,
-`DEEPMS_BATCH_SIZE`, `DEEPMS_NUM_WORKERS`,
+`DEEPMS_INFERENCE_BATCH_SIZE` (default `8`), `DEEPMS_NUM_WORKERS`,
 `DEEPMS_MIXED_PRECISION` (`no`, `fp16`, or `bf16`), and
 `DEEPMS_REPORT_BOOTSTRAPS`.
 

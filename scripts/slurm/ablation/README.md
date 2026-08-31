@@ -148,14 +148,15 @@ only after the matching training element succeeds. Summary jobs still use
 instead of remaining pending indefinitely. The default array cap is four
 concurrent tasks and can be changed with `DEEPMS_ABLATION_CONCURRENCY=1..12`.
 
-`DEEPMS_TRAIN_EXCLUDE_NODES` accepts a comma-separated, site-local list of
-training nodes with known GPU health problems. The Shenlab profile currently
-excludes `a100-4011,a100-4012,a100-4024,a100-4033`; every training allocation also probes both
-visible CUDA devices before loading data. The `a100_dev` inference partition
-does not contain those excluded training nodes, and every inference allocation
-runs the same context, compute, synchronization, and PCI-inventory probe on its
-single visible GPU. Do not use `--exclusive` as a substitute for these health
-checks: a two-GPU task would otherwise reserve an entire four-GPU node.
+`DEEPMS_TRAIN_EXCLUDE_NODES` and `DEEPMS_INFER_EXCLUDE_NODES` accept
+comma-separated, site-local lists of nodes with known GPU health problems. The
+Shenlab profile excludes `a100-4011,a100-4012,a100-4024,a100-4033` for training
+and `a100-4004` for inference. Every allocation still runs a context, compute,
+synchronization, and PCI-inventory probe before loading data. Inference uses
+the independent `DEEPMS_INFERENCE_BATCH_SIZE=8`; the training batch size is not
+reused by single-GPU inference. Do not use `--exclusive` as a substitute for
+these health checks: a two-GPU task would otherwise reserve an entire four-GPU
+node.
 Application failures are not automatically requeued. After a failed scientific
 run, correct the cause and use a new evaluation ID rather than writing into a
 partially populated output root. Inference also requires the atomic

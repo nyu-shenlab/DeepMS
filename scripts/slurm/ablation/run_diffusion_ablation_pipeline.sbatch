@@ -108,6 +108,14 @@ if [[ -n "${TRAIN_EXCLUDE_NODES}" ]]; then
     [[ "${TRAIN_EXCLUDE_NODES}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] || \
         fail "DEEPMS_TRAIN_EXCLUDE_NODES must be a comma-separated node list."
 fi
+INFER_EXCLUDE_NODES="${DEEPMS_INFER_EXCLUDE_NODES:-}"
+if [[ -n "${INFER_EXCLUDE_NODES}" ]]; then
+    [[ "${INFER_EXCLUDE_NODES}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] || \
+        fail "DEEPMS_INFER_EXCLUDE_NODES must be a comma-separated node list."
+fi
+INFERENCE_BATCH_SIZE="${DEEPMS_INFERENCE_BATCH_SIZE:-8}"
+[[ "${INFERENCE_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]] || \
+    fail "DEEPMS_INFERENCE_BATCH_SIZE must be a positive integer."
 
 TRAIN_ROOT="${DEEPMS_PIPELINE_TRAIN_ROOT:-${PROJECT_ROOT}/outputs/train/diffusion_single_map/${EVALUATION_ID}}"
 INFERENCE_ROOT="${DEEPMS_ABLATION_INFERENCE_ROOT:-${PROJECT_ROOT}/outputs/inference/diffusion_single_map}"
@@ -137,6 +145,8 @@ STATE_FILE="${STATE_DIR}/pipeline_jobs.env"
     printf 'EVALUATION_ROOT=%q\n' "${EVALUATION_ROOT}"
     printf 'ARRAY_SPEC=%q\n' "${ARRAY_SPEC}"
     printf 'TRAIN_EXCLUDE_NODES=%q\n' "${TRAIN_EXCLUDE_NODES}"
+    printf 'INFER_EXCLUDE_NODES=%q\n' "${INFER_EXCLUDE_NODES}"
+    printf 'INFERENCE_BATCH_SIZE=%q\n' "${INFERENCE_BATCH_SIZE}"
 } > "${STATE_FILE}"
 
 GRAPH_RELEASED=0
@@ -200,23 +210,28 @@ submit_inference() {
     local training_job_id="$2"
     local export_spec
     local response
+    local -a submit_args
     export_spec="ALL,DEEPMS_PROJECT_ROOT=${PROJECT_ROOT}"
     export_spec+=",DEEPMS_ABLATION_CHECKPOINT_ROOT=${TRAIN_ROOT}"
     export_spec+=",DEEPMS_ABLATION_INFERENCE_ROOT=${INFERENCE_ROOT}"
     export_spec+=",DEEPMS_ABLATION_EVAL_ID=${EVALUATION_ID}"
     export_spec+=",DEEPMS_ABLATION_INFER_PROFILE=${profile}"
     export_spec+=",DEEPMS_PREFLIGHT_ONLY=0"
+    submit_args=(
+        --parsable
+        --hold
+        --no-requeue
+        --job-name="deepms-infer-${profile:0:12}-${RUN_TAG}"
+        --array="${ARRAY_SPEC}"
+        --dependency="aftercorr:${training_job_id}"
+        --kill-on-invalid-dep=yes
+        --export="${export_spec}"
+    )
+    if [[ -n "${INFER_EXCLUDE_NODES}" ]]; then
+        submit_args+=(--exclude="${INFER_EXCLUDE_NODES}")
+    fi
     response="$(
-        sbatch \
-            --parsable \
-            --hold \
-            --no-requeue \
-            --job-name="deepms-infer-${profile:0:12}-${RUN_TAG}" \
-            --array="${ARRAY_SPEC}" \
-            --dependency="aftercorr:${training_job_id}" \
-            --kill-on-invalid-dep=yes \
-            --export="${export_spec}" \
-            "${INFER_JOB}"
+        sbatch "${submit_args[@]}" "${INFER_JOB}"
     )"
     parse_job_id "${response}"
 }

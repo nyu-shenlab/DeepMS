@@ -112,8 +112,10 @@ printf '2000;test-cluster\\n'
         "DEEPMS_ABLATION_INFER_PROFILE": "public_external_unmasked",
         "DEEPMS_VAL_NUM_WORKERS": "0",
         "DEEPMS_EXPECTED_GPUS": "2",
+        "DEEPMS_INFERENCE_BATCH_SIZE": "8",
         "DEEPMS_ABLATION_CONCURRENCY": "4",
         "DEEPMS_TRAIN_EXCLUDE_NODES": "a100-4011,a100-4012,a100-4024,a100-4033",
+        "DEEPMS_INFER_EXCLUDE_NODES": "a100-4004",
     }
     profile.write_text(
         "\n".join(f"export {name}={shlex.quote(value)}" for name, value in profile_values.items()) + "\n",
@@ -166,6 +168,7 @@ def test_default_checks_every_request_without_creating_jobs(
     assert completed.returncode == 0, completed.stderr
     assert len(commands) == 4
     assert all("--test-only" in command for command in commands)
+    assert "--exclude=a100-4004" in commands[2]
     assert not state_file.exists()
     assert "CHECK-ONLY" in completed.stdout
 

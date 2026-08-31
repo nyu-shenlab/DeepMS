@@ -94,6 +94,8 @@ printf '\n' >> "${FAKE_SCANCEL_LOG}"
             "DEEPMS_ABLATION_EVAL_ID": evaluation_id,
             "DEEPMS_ABLATION_CONCURRENCY": "3",
             "DEEPMS_TRAIN_EXCLUDE_NODES": "node-bad-1,node-bad-2",
+            "DEEPMS_INFER_EXCLUDE_NODES": "infer-bad-1,infer-bad-2",
+            "DEEPMS_INFERENCE_BATCH_SIZE": "8",
             "DEEPMS_PIPELINE_TRAIN_ROOT": str(tmp_path / "train" / evaluation_id),
             "DEEPMS_ABLATION_INFERENCE_ROOT": str(tmp_path / "inference"),
             "DEEPMS_PIPELINE_STATE_ROOT": str(state_root),
@@ -149,6 +151,7 @@ def test_dataset_pipeline_submits_train_infer_summary_dependency_chain(
     assert training[-1].endswith("train_diffusion_ablation.sbatch")
     assert "--dependency=aftercorr:1001" in inference
     assert "--kill-on-invalid-dep=yes" in inference
+    assert "--exclude=infer-bad-1,infer-bad-2" in inference
     assert "DEEPMS_ABLATION_INFER_PROFILE=krakow" in _export_argument(inference)
     assert inference[-1].endswith("infer_diffusion_ablation.sbatch")
     assert "--dependency=afterok:1002" in summary
@@ -162,6 +165,8 @@ def test_dataset_pipeline_submits_train_infer_summary_dependency_chain(
     state = state_file.read_text(encoding="utf-8")
     assert "PIPELINE_STATUS=scheduled" in state
     assert r"TRAIN_EXCLUDE_NODES=node-bad-1\,node-bad-2" in state
+    assert r"INFER_EXCLUDE_NODES=infer-bad-1\,infer-bad-2" in state
+    assert "INFERENCE_BATCH_SIZE=8" in state
     assert "TRAIN_JOB_ID=1001" in state
     assert "DATASET_INFER_JOB_ID=1002" in state
     assert "DATASET_SUMMARY_JOB_ID=1003" in state
@@ -182,6 +187,8 @@ def test_both_pipeline_reuses_unmasked_inference_and_schedules_two_summaries(
     assert "--dependency=aftercorr:1001" in masked
     assert "--kill-on-invalid-dep=yes" in unmasked
     assert "--kill-on-invalid-dep=yes" in masked
+    assert "--exclude=infer-bad-1,infer-bad-2" in unmasked
+    assert "--exclude=infer-bad-1,infer-bad-2" in masked
     assert "DEEPMS_ABLATION_INFER_PROFILE=public_external_unmasked" in _export_argument(unmasked)
     assert "DEEPMS_ABLATION_INFER_PROFILE=public_external_masked" in _export_argument(masked)
 
@@ -256,6 +263,8 @@ def test_shenlab_launcher_loads_a_site_profile_and_submits_the_full_graph(
         "DEEPMS_ABLATION_EVAL_ID",
         "DEEPMS_ABLATION_CONCURRENCY",
         "DEEPMS_TRAIN_EXCLUDE_NODES",
+        "DEEPMS_INFER_EXCLUDE_NODES",
+        "DEEPMS_INFERENCE_BATCH_SIZE",
         "DEEPMS_PIPELINE_TRAIN_ROOT",
         "DEEPMS_ABLATION_INFERENCE_ROOT",
         "DEEPMS_PIPELINE_STATE_ROOT",
@@ -363,3 +372,47 @@ def test_empty_training_exclude_list_adds_no_sbatch_exclusion(tmp_path: Path) ->
     assert completed.returncode == 0, completed.stderr
     commands = [shlex.split(line) for line in command_log.read_text(encoding="utf-8").splitlines()]
     assert not any(argument.startswith("--exclude=") for argument in commands[0])
+
+
+def test_invalid_inference_exclude_list_submits_no_child_jobs(tmp_path: Path) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(
+        tmp_path,
+        mode="both",
+    )
+    environment["DEEPMS_INFER_EXCLUDE_NODES"] = "infer-bad-1 infer-bad-2"
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "DEEPMS_INFER_EXCLUDE_NODES must be a comma-separated node list" in completed.stderr
+    assert not command_log.exists() or not command_log.read_text(encoding="utf-8").strip()
+    assert not state_file.exists()
+
+
+def test_invalid_inference_batch_size_submits_no_child_jobs(tmp_path: Path) -> None:
+    environment, command_log, state_file = _fake_pipeline_environment(
+        tmp_path,
+        mode="both",
+    )
+    environment["DEEPMS_INFERENCE_BATCH_SIZE"] = "0"
+
+    completed = subprocess.run(
+        ["bash", str(PIPELINE_SCRIPT)],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "DEEPMS_INFERENCE_BATCH_SIZE must be a positive integer" in completed.stderr
+    assert not command_log.exists() or not command_log.read_text(encoding="utf-8").strip()
+    assert not state_file.exists()
