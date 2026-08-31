@@ -151,10 +151,16 @@ def test_remaining_diffusion_ablation_is_isolated_and_excludes_completed_maps() 
     text = read_slurm("ablation/train_remaining_diffusion_ablation.sbatch")
 
     assert "#SBATCH --array=0-1,4-6,8-11%4" in text
-    assert "#SBATCH --exclude=a100-4011,a100-4012,a100-4024,a100-4033" in text
+    assert (
+        "#SBATCH --exclude=a100-4011,a100-4012,a100-4015,"
+        "a100-4024,a100-4028,a100-4033"
+    ) in text
     assert "#SBATCH --chdir" not in text
     assert "#SBATCH --gres=gpu:2" in text
-    assert "#SBATCH --no-requeue" in text
+    assert "#SBATCH --requeue" in text
+    assert "#SBATCH --no-requeue" not in text
+    assert "slurm-%x-%A_%a-r%r.out" in text
+    assert "slurm-%x-%A_%a-r%r.err" in text
     assert "SHENLAB_PROJECT_ROOT" not in text
     assert 'PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"' in text
     assert 'cd -- "${PROJECT_ROOT}"' in text
@@ -165,7 +171,14 @@ def test_remaining_diffusion_ablation_is_isolated_and_excludes_completed_maps() 
     assert "Task 3 (f_smi) is already complete and is excluded." in text
     assert "Task 7 (md_dti) is already complete and is excluded." in text
     assert "train_diffusion_ablation.sbatch" in text
-    assert 'exec bash "${TRAIN_JOB}"' in text
+    assert 'find "${TARGET_ROOT}" -mindepth 1 -print -quit' in text
+    assert "non-empty output directory" in text
+    assert 'MAX_CUDA_REQUEUES="${DEEPMS_CUDA_MAX_REQUEUES:-3}"' in text
+    assert 'RESTART_COUNT="${SLURM_RESTART_COUNT:-0}"' in text
+    assert "if (( status != 75 )); then" in text
+    assert 'JOB_ELEMENT="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"' in text
+    assert 'scontrol requeue "${JOB_ELEMENT}"' in text
+    assert 'exec bash "${TRAIN_JOB}"' not in text
 
 
 def test_diffusion_ablation_inference_and_final_summary_contract() -> None:

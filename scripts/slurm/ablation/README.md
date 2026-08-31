@@ -90,6 +90,26 @@ also rejects indices 2, 3, and 7 if someone overrides the array on the command
 line. Code, Slurm logs, and model outputs remain under the submitting clone.
 This job performs training only; it creates no inference or summary jobs.
 
+Before training starts, every allocated GPU must pass the CUDA context and
+compute probe. Exit code `75` from that probe requeues only the affected array
+element, up to three times by default; set `DEEPMS_CUDA_MAX_REQUEUES` to a
+different non-negative bound when needed. Training errors, OOMs, and all other
+exit codes are never retried automatically. Restart-specific logs include
+`-r<restart-count>` in their names. The recovery job conservatively excludes
+the currently identified bad Shenlab nodes at node granularity because Slurm
+does not expose a per-GPU UUID exclusion in this job interface.
+
+A preflight failure may leave an empty `<family>/<map>` directory. Retrying the
+same evaluation ID may reuse that empty directory, while any non-empty map
+directory remains protected. To retry selected failed indices into a prior
+root without rerunning successful or active elements:
+
+```bash
+DEEPMS_REMAINING_EVAL_ID=remaining-9maps-<prior-array-job-id> \
+sbatch --array=<failed-indices>%4 \
+  scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+```
+
 On another cluster, load a site-local copy of the portable template instead:
 
 ```bash

@@ -297,6 +297,13 @@ sbatch --test-only scripts/slurm/ablation/train_remaining_diffusion_ablation.sba
 sbatch scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
 ```
 
+This recovery array validates each allocated GPU before training. A CUDA
+allocation preflight failure is requeued up to three times, with a distinct
+restart-counted log, while training failures and OOMs remain final. Empty map
+directories left by a failed preflight can be reused safely; non-empty map
+directories are still rejected. See the ablation README for targeted retry
+syntax and the current conservative Shenlab node exclusions.
+
 Array indices follow the requested order: SMI (`Da_smi`, `DePar_smi`,
 `DePerp_smi`, `f_smi`, `p2_smi`), DTI (`ad_dti`, `fa_dti`,
 `md_dti`, `rd_dti`), then DKI (`ak_wdki`, `mk_wdki`, `rk_wdki`).
