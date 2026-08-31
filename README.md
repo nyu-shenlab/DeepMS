@@ -286,6 +286,16 @@ at most four running concurrently:
 sbatch scripts/slurm/ablation/train_diffusion_ablation.sbatch
 ```
 
+For the targeted Shenlab rerun that excludes the already completed
+`DePerp_smi`, `f_smi`, and `md_dti` arms, use the dedicated nine-task array.
+Its canonical working directory and per-array-job output root make concurrent
+submissions independent:
+
+```bash
+sbatch --test-only /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+sbatch /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+```
+
 Array indices follow the requested order: SMI (`Da_smi`, `DePar_smi`,
 `DePerp_smi`, `f_smi`, `p2_smi`), DTI (`ad_dti`, `fa_dti`,
 `md_dti`, `rd_dti`), then DKI (`ak_wdki`, `mk_wdki`, `rk_wdki`).

@@ -113,7 +113,7 @@ printf '2000;test-cluster\\n'
         "DEEPMS_VAL_NUM_WORKERS": "0",
         "DEEPMS_EXPECTED_GPUS": "2",
         "DEEPMS_ABLATION_CONCURRENCY": "4",
-        "DEEPMS_TRAIN_EXCLUDE_NODES": "a100-4011,a100-4024",
+        "DEEPMS_TRAIN_EXCLUDE_NODES": "a100-4011,a100-4012,a100-4024,a100-4033",
     }
     profile.write_text(
         "\n".join(f"export {name}={shlex.quote(value)}" for name, value in profile_values.items()) + "\n",

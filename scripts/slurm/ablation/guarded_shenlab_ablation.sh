@@ -112,7 +112,7 @@ CONCURRENCY="${DEEPMS_ABLATION_CONCURRENCY:-}"
 TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-}"
 [[ "${TRAIN_EXCLUDE_NODES}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(,[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] || \
     fail "DEEPMS_TRAIN_EXCLUDE_NODES must be a comma-separated node list."
-for required_node in a100-4011 a100-4024; do
+for required_node in a100-4011 a100-4012 a100-4024 a100-4033; do
     case ",${TRAIN_EXCLUDE_NODES}," in
         *",${required_node},"*) ;;
         *) fail "The Shenlab exclusion list must include ${required_node}." ;;

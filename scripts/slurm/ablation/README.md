@@ -68,6 +68,25 @@ resolve the `uv` installed by the current user, and derive the project root from
 the current clone. They do not contain credentials or clinical records. Slurm
 jobs validate the locked environment without installing packages.
 
+## Targeted training-only rerun of the remaining nine maps
+
+The Shenlab recovery job below omits the three completed maps (`DePerp_smi`,
+`f_smi`, and `md_dti`) and trains only array indices
+`0,1,4,5,6,8,9,10,11`. It is pinned to the shared canonical checkout, so a
+collaborator can use the absolute command from any working directory:
+
+```bash
+sbatch --test-only /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+sbatch /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+```
+
+The array runs at most four tasks concurrently, with two A100 GPUs per task.
+Every submission writes to its own
+`outputs/train/diffusion_single_map/remaining-9maps-<array-job-id>/` root, so
+simultaneous submissions do not share model directories. The runtime guard
+also rejects indices 2, 3, and 7 if someone overrides the array on the command
+line. This job performs training only; it creates no inference or summary jobs.
+
 On another cluster, load a site-local copy of the portable template instead:
 
 ```bash
@@ -108,6 +127,7 @@ keeping all of those worker pools resident can exhaust host memory.
 | `submit_shenlab_ablation.sbatch` | Direct Shenlab profile loading and complete workflow submission | CPU only |
 | `run_diffusion_ablation_pipeline.sbatch` | Preflight and dependency-graph submission | CPU only |
 | `train_diffusion_ablation.sbatch` | 12 map-specific training tasks | 2 GPUs per task |
+| `train_remaining_diffusion_ablation.sbatch` | Shenlab-only rerun of the 9 incomplete maps | 2 GPUs per task, at most 4 tasks |
 | `infer_diffusion_ablation.sbatch` | 12 map-specific, structural-only inference tasks per profile | 1 GPU per task |
 | `summarize_inference_runs.sbatch` | Complete-run validation and final report | CPU only |
 
@@ -130,7 +150,7 @@ concurrent tasks and can be changed with `DEEPMS_ABLATION_CONCURRENCY=1..12`.
 
 `DEEPMS_TRAIN_EXCLUDE_NODES` accepts a comma-separated, site-local list of
 training nodes with known GPU health problems. The Shenlab profile currently
-excludes `a100-4011,a100-4024`; every training allocation also probes both
+excludes `a100-4011,a100-4012,a100-4024,a100-4033`; every training allocation also probes both
 visible CUDA devices before loading data. The `a100_dev` inference partition
 does not contain those excluded training nodes, and every inference allocation
 runs the same context, compute, synchronization, and PCI-inventory probe on its

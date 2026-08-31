@@ -25,6 +25,7 @@ def test_ablation_jobs_are_grouped_in_a_dedicated_subfolder() -> None:
         "submit_shenlab_ablation.sbatch",
         "summarize_inference_runs.sbatch",
         "train_diffusion_ablation.sbatch",
+        "train_remaining_diffusion_ablation.sbatch",
     }
     assert not list(SLURM_DIR.glob("*ablation*.sbatch"))
     assert "sbatch scripts/slurm/ablation/submit_shenlab_ablation.sbatch" in (
@@ -78,7 +79,10 @@ def test_shenlab_site_profile_is_copy_ready() -> None:
     assert "export DEEPMS_SAVE_INTERVAL=5" in text
     assert "export DEEPMS_VAL_NUM_WORKERS=0" in text
     assert "export DEEPMS_EXPECTED_GPUS=2" in text
-    assert ('export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-a100-4011,a100-4024}"') in text
+    assert (
+        'export DEEPMS_TRAIN_EXCLUDE_NODES="${DEEPMS_TRAIN_EXCLUDE_NODES:-'
+        'a100-4011,a100-4012,a100-4024,a100-4033}"'
+    ) in text
     assert "export DEEPMS_PIPELINE_MODE=both" in text
     assert "export DEEPMS_INCLUDE_B0=1" in text
     assert "export DEEPMS_SAVE_VISUALIZATIONS=0" in text
@@ -139,6 +143,26 @@ def test_diffusion_ablation_order_and_single_map_contract() -> None:
     assert "${STRUCTURAL_MODALITIES[*]} ${DIFFUSION_MAP}" in text
     assert "${STRUCTURAL_VAL_MODALITIES[*]} ${DIFFUSION_MAP}" in text
     assert "${ABLATION_OUTPUT_ROOT}/${DIFFUSION_FAMILY}/${DIFFUSION_MAP}" in text
+
+
+def test_remaining_diffusion_ablation_is_isolated_and_excludes_completed_maps() -> None:
+    text = read_slurm("ablation/train_remaining_diffusion_ablation.sbatch")
+
+    assert "#SBATCH --array=0-1,4-6,8-11%4" in text
+    assert "#SBATCH --exclude=a100-4011,a100-4012,a100-4024,a100-4033" in text
+    assert "#SBATCH --chdir=/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS" in text
+    assert "#SBATCH --gres=gpu:2" in text
+    assert "#SBATCH --no-requeue" in text
+    assert 'SHENLAB_PROJECT_ROOT="/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS"' in text
+    assert 'PROJECT_ROOT="${DEEPMS_PROJECT_ROOT:-${SHENLAB_PROJECT_ROOT}}"' in text
+    assert 'cd -- "${PROJECT_ROOT}"' in text
+    assert "remaining-9maps-${SLURM_ARRAY_JOB_ID}" in text
+    assert '${RUN_ROOT}/${DIFFUSION_FAMILY}/${DIFFUSION_MAP}' in text
+    assert "Task 2 (DePerp_smi) is already complete and is excluded." in text
+    assert "Task 3 (f_smi) is already complete and is excluded." in text
+    assert "Task 7 (md_dti) is already complete and is excluded." in text
+    assert "train_diffusion_ablation.sbatch" in text
+    assert 'exec bash "${TRAIN_JOB}"' in text
 
 
 def test_diffusion_ablation_inference_and_final_summary_contract() -> None:
