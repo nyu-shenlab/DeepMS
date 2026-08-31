@@ -288,12 +288,13 @@ sbatch scripts/slurm/ablation/train_diffusion_ablation.sbatch
 
 For the targeted Shenlab rerun that excludes the already completed
 `DePerp_smi`, `f_smi`, and `md_dti` arms, use the dedicated nine-task array.
-Its canonical working directory and per-array-job output root make concurrent
-submissions independent:
+Its clone-local project resolution and per-array-job output root make
+concurrent submissions independent. Submit it from the intended clone root:
 
 ```bash
-sbatch --test-only /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
-sbatch /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+cd /path/to/your/DeepMS
+sbatch --test-only scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+sbatch scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
 ```
 
 Array indices follow the requested order: SMI (`Da_smi`, `DePar_smi`,

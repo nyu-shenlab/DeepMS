@@ -12,7 +12,6 @@
 #SBATCH --gres=gpu:2
 #SBATCH --array=0-1,4-6,8-11%4
 #SBATCH --exclude=a100-4011,a100-4012,a100-4024,a100-4033
-#SBATCH --chdir=/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS
 
 set -euo pipefail
 umask 002
@@ -22,14 +21,13 @@ fail() {
     exit 1
 }
 
-# This is a Shenlab-specific recovery job for the shared canonical checkout.
-# DEEPMS_PROJECT_ROOT remains an explicit escape hatch for a deliberate clone.
-SHENLAB_PROJECT_ROOT="/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS"
-PROJECT_ROOT="${DEEPMS_PROJECT_ROOT:-${SHENLAB_PROJECT_ROOT}}"
+# Keep code, logs, and outputs under the clone from which this job was
+# submitted. Submit from the intended DeepMS clone root.
+PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"
 cd -- "${PROJECT_ROOT}" || fail "DeepMS repository is unavailable: ${PROJECT_ROOT}"
 PROJECT_ROOT="$(pwd -P)"
 [[ -f pyproject.toml && -f uv.lock ]] || \
-    fail "DeepMS repository metadata is missing: ${PROJECT_ROOT}"
+    fail "Submit from the intended DeepMS repository root: ${PROJECT_ROOT}"
 
 SITE_PROFILE="${DEEPMS_SITE_PROFILE:-${PROJECT_ROOT}/configs/slurm.shenlab.env}"
 [[ -f "${SITE_PROFILE}" ]] || fail "Shenlab site profile not found: ${SITE_PROFILE}"

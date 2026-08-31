@@ -152,12 +152,13 @@ def test_remaining_diffusion_ablation_is_isolated_and_excludes_completed_maps() 
 
     assert "#SBATCH --array=0-1,4-6,8-11%4" in text
     assert "#SBATCH --exclude=a100-4011,a100-4012,a100-4024,a100-4033" in text
-    assert "#SBATCH --chdir=/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS" in text
+    assert "#SBATCH --chdir" not in text
     assert "#SBATCH --gres=gpu:2" in text
     assert "#SBATCH --no-requeue" in text
-    assert 'SHENLAB_PROJECT_ROOT="/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS"' in text
-    assert 'PROJECT_ROOT="${DEEPMS_PROJECT_ROOT:-${SHENLAB_PROJECT_ROOT}}"' in text
+    assert "SHENLAB_PROJECT_ROOT" not in text
+    assert 'PROJECT_ROOT="${SLURM_SUBMIT_DIR:-$PWD}"' in text
     assert 'cd -- "${PROJECT_ROOT}"' in text
+    assert "/gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS" not in text
     assert "remaining-9maps-${SLURM_ARRAY_JOB_ID}" in text
     assert '${RUN_ROOT}/${DIFFUSION_FAMILY}/${DIFFUSION_MAP}' in text
     assert "Task 2 (DePerp_smi) is already complete and is excluded." in text

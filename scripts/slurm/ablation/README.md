@@ -72,12 +72,14 @@ jobs validate the locked environment without installing packages.
 
 The Shenlab recovery job below omits the three completed maps (`DePerp_smi`,
 `f_smi`, and `md_dti`) and trains only array indices
-`0,1,4,5,6,8,9,10,11`. It is pinned to the shared canonical checkout, so a
-collaborator can use the absolute command from any working directory:
+`0,1,4,5,6,8,9,10,11`. It derives its project and output roots from the clone
+where `sbatch` is invoked. Each collaborator must therefore submit from their
+own intended clone root:
 
 ```bash
-sbatch --test-only /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
-sbatch /gpfs/data/shenlab/Jiajian/MS_Project/code/DeepMS/scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+cd /path/to/your/DeepMS
+sbatch --test-only scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
+sbatch scripts/slurm/ablation/train_remaining_diffusion_ablation.sbatch
 ```
 
 The array runs at most four tasks concurrently, with two A100 GPUs per task.
@@ -85,7 +87,8 @@ Every submission writes to its own
 `outputs/train/diffusion_single_map/remaining-9maps-<array-job-id>/` root, so
 simultaneous submissions do not share model directories. The runtime guard
 also rejects indices 2, 3, and 7 if someone overrides the array on the command
-line. This job performs training only; it creates no inference or summary jobs.
+line. Code, Slurm logs, and model outputs remain under the submitting clone.
+This job performs training only; it creates no inference or summary jobs.
 
 On another cluster, load a site-local copy of the portable template instead:
 
